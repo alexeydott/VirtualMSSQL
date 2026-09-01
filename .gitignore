@@ -1,0 +1,20 @@
+# Project documents — research package, local only
+01_TZ_VirtualMSSQL.md
+02_ROADMAP_VirtualMSSQL.md
+03_RESEARCH_NOTES_AND_SOURCES.md
+opencode.json
+.agents/
+.ai-factory/
+.ai-factory.json
+.claude/
+.codex/
+.github/
+.mcp.json
+.opencode/
+.qwen/
+.vscode/
+
+# Build artifacts
+build/
+out/
+*.user
