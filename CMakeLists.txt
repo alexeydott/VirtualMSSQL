@@ -24,6 +24,7 @@ add_library(vms_client STATIC
     src/vms_credentials.c
     src/vms_connstr.c
     src/vms_pool.c
+    src/vms_meta.c
 )
 target_include_directories(vms_client PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src

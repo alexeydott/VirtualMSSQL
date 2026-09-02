@@ -276,10 +276,11 @@ static void job_meta(void* arg)
         SQLSMALLINT name_len = 0, nullable = 0, digits = 0, sql_type = 0;
         SQLULEN col_size = 0;
         char name_u8[128];
-        if (!SQL_SUCCEEDED(SQLDescribeColW(op->st->hstmt, (SQLUSMALLINT)i, name,
-                                           (SQLSMALLINT)(sizeof(name) / sizeof(name[0])),
-                                           &name_len, &sql_type, &col_size,
-                                           &digits, &nullable))) {
+        SQLRETURN dr = SQLDescribeColW(op->st->hstmt, (SQLUSMALLINT)i, name,
+                                       (SQLSMALLINT)(sizeof(name) / sizeof(name[0])),
+                                       &name_len, &sql_type, &col_size,
+                                       &digits, &nullable);
+        if (!SQL_SUCCEEDED(dr)) {
             int q;
             diag_capture(op->err, SQL_HANDLE_STMT, op->st->hstmt, "SQLDescribeColW", &q);
             op->ok = 0;

@@ -89,3 +89,9 @@ add_executable(test_r4 test_r4.c)
 target_link_libraries(test_r4 PRIVATE vms_client)
 target_compile_options(test_r4 PRIVATE /utf-8)
 add_test(NAME r4 COMMAND test_r4)
+
+# ---- suite 8: metadata/stable key/identity (G5) ----
+add_executable(test_r5 test_r5.c)
+target_link_libraries(test_r5 PRIVATE vms_client)
+target_compile_options(test_r5 PRIVATE /utf-8)
+add_test(NAME r5 COMMAND test_r5)
