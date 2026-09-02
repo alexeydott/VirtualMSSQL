@@ -83,3 +83,9 @@ target_compile_options(test_client PRIVATE /utf-8)
 target_link_libraries(test_client PRIVATE vms_client)
 add_test(NAME client COMMAND test_client)
 set_tests_properties(client PROPERTIES SKIP_RETURN_CODE 77)
+
+# ---- suite 7: credentials/connstr/pool (G4) ----
+add_executable(test_r4 test_r4.c)
+target_link_libraries(test_r4 PRIVATE vms_client)
+target_compile_options(test_r4 PRIVATE /utf-8)
+add_test(NAME r4 COMMAND test_r4)

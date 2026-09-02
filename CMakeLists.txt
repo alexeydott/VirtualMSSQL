@@ -13,7 +13,7 @@ endif()
 find_package(SQLite3 QUIET)
 set(VMS_SQLITE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
 
-# ---- vms_client (R3 runtime): static lib for tests + objects in the DLL ----
+# ---- vms_client (R3/R4 runtime): static lib for tests + linked into DLL ----
 add_library(vms_client STATIC
     src/vms_odbc_adapter.c
     src/vms_odbc_worker.c
@@ -21,6 +21,9 @@ add_library(vms_client STATIC
     src/vms_limits.c
     src/vms_log.c
     src/vms_faultalloc.c
+    src/vms_credentials.c
+    src/vms_connstr.c
+    src/vms_pool.c
 )
 target_include_directories(vms_client PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -32,7 +35,7 @@ target_compile_definitions(vms_client PRIVATE
     UNICODE
     _UNICODE
 )
-target_link_libraries(vms_client PUBLIC odbc32)
+target_link_libraries(vms_client PUBLIC odbc32 advapi32)
 target_compile_options(vms_client PRIVATE /W4 /utf-8)
 
 # ---- virtualmssql.dll (loadable extension) ----

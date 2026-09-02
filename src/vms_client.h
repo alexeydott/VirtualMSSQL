@@ -109,6 +109,12 @@ int vms_tran_begin(VmsConnection* cn, VmsError* err);
 int vms_tran_commit(VmsConnection* cn, VmsError* err);
 int vms_tran_rollback(VmsConnection* cn, VmsError* err);
 
+/* ---- pool support ----
+ * Clean-state verification for reuse decisions: not quarantined,
+ * @@TRANCOUNT == 0, SELECT 1 round-trip works. 1 = clean.
+ * Connection reuse is allowed only with a proven clean state. */
+int vms_conn_verify(VmsConnection* cn);
+
 #ifdef __cplusplus
 }
 #endif

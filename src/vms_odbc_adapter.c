@@ -783,6 +783,51 @@ int vms_stmt_cancel(VmsStatement* st)
     return 1;
 }
 
+typedef struct OpVerify {
+    VmsConnection* cn;
+    int ok;
+} OpVerify;
+
+static void job_verify(void* arg)
+{
+    OpVerify* op = (OpVerify*)arg;
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    SQLRETURN r;
+    SQLBIGINT trancount = -1;
+    SQLLEN ind = 0;
+    SQLWCHAR q1[] = L"SELECT @@TRANCOUNT";
+    SQLWCHAR q2[] = L"SELECT 1";
+
+    op->ok = 0;
+    if (InterlockedCompareExchange(&op->cn->quarantined, 0, 0)) return;
+
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &st))) return;
+    r = SQLExecDirectW(st, q1, SQL_NTS);
+    if (!SQL_SUCCEEDED(r)) { SQLFreeHandle(SQL_HANDLE_STMT, st); return; }
+    if (!SQL_SUCCEEDED(SQLFetch(st)) ||
+        !SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_SBIGINT, &trancount, 0, &ind)) ||
+        trancount != 0) {
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+        return; /* open transaction: not clean */
+    }
+    SQLFreeStmt(st, SQL_CLOSE);
+    r = SQLExecDirectW(st, q2, SQL_NTS);
+    SQLFreeStmt(st, SQL_CLOSE);
+    if (!SQL_SUCCEEDED(r)) { SQLFreeHandle(SQL_HANDLE_STMT, st); return; }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    op->ok = 1;
+}
+
+int vms_conn_verify(VmsConnection* cn)
+{
+    OpVerify op;
+    if (!cn) return 0;
+    op.cn = cn;
+    op.ok = 0;
+    vms_worker_run(cn->worker, job_verify, &op);
+    return op.ok;
+}
+
 int vms_conn_cancel(VmsConnection* cn)
 {
     if (!cn) return 0;
