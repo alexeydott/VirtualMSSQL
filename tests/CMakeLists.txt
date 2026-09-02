@@ -111,6 +111,18 @@ add_dependencies(test_r6 virtualmssql)
 add_test(NAME r6
     COMMAND test_r6 $<TARGET_FILE:virtualmssql>)
 
+# ---- suite 10: safe pushdown differential (G7; needs live server) ----
+add_executable(test_r7 test_r7.c)
+target_include_directories(test_r7 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_link_libraries(test_r7 PRIVATE vms_test_harness vms_client)
+target_compile_options(test_r7 PRIVATE /utf-8)
+add_dependencies(test_r7 virtualmssql)
+add_test(NAME r7
+    COMMAND test_r7 $<TARGET_FILE:virtualmssql>)
+
 # seed helper (not a test): creates R6 fixtures on the live server
 add_executable(seed_r6 seed_r6.c)
 target_link_libraries(seed_r6 PRIVATE vms_client)

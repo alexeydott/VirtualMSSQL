@@ -10,6 +10,7 @@
  * absent: R6 is read-only; writes arrive in R10. */
 #include "vms_vtab.h"
 #include "vms_meta.h"
+#include "vms_plan.h"
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,6 +39,10 @@ struct VmsVtabCursor {
     VmsCursor* cur;     /* lease; NULL when the scan finished/closed early */
     int eof;
     sqlite3_int64 rowid_counter;
+    /* R7: map vtab column index -> position in the remote projection.
+     * -1 = column not projected (xColumn must not read it, but SQLite only
+     * calls xColumn for colUsed columns which are all projected). */
+    int col_map[512];
 };
 
 static VmsVtabEnv* g_env = NULL; /* single-module env for R6 */
@@ -205,14 +210,34 @@ static int vms_vtab_disconnect(sqlite3_vtab* vtab)
     return SQLITE_OK;
 }
 
-/* ---------- xBestIndex (R6 baseline: full scan) ---------- */
+/* ---------- xBestIndex (R7: safe pushdown) ---------- */
 
 static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
 {
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsPlan plan;
+    char buf[sizeof(VmsPlan)];
+
     (void)vtab;
-    info->estimatedCost = 1000000.0;
-    info->estimatedRows = 100000;
-    info->idxNum = 0; /* full scan plan id */
+    if (!vms_plan_compile(info, tab->cols, tab->ncols, &plan)) {
+        info->estimatedCost = 1000000.0;
+        info->estimatedRows = 100000;
+        info->idxNum = 0;
+        return SQLITE_OK;
+    }
+    if (!vms_plan_serialize(&plan, buf, sizeof(buf))) {
+        info->estimatedCost = 1000000.0;
+        info->estimatedRows = 100000;
+        info->idxNum = 0;
+        return SQLITE_OK;
+    }
+    info->idxNum = 1; /* pushed-down plan */
+    info->idxStr = (char*)sqlite3_malloc(sizeof(VmsPlan));
+    if (!info->idxStr) return SQLITE_NOMEM;
+    memcpy(info->idxStr, buf, sizeof(VmsPlan));
+    info->needToFreeIdxStr = 1;
+    info->estimatedCost = plan.nterms > 0 ? 100.0 : 100000.0;
+    info->estimatedRows = 1000;
     return SQLITE_OK;
 }
 
@@ -248,7 +273,12 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
     struct VmsVtab* tab = cur->tab;
     VmsError err;
     VmsConnection* lease;
-    (void)idxNum; (void)idxStr; (void)argc; (void)argv;
+    wchar_t sql[2048];
+    long long plan_limit = -1;
+    long long plan_offset = 0;
+    long long term_params[VMS_PLAN_MAX_ARGS];
+    VmsPlan plan;
+    int have_plan = 0;
 
     memset(&err, 0, sizeof(err));
     /* start a fresh scan on an independent lease from the env pool */
@@ -256,13 +286,130 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         vms_cursor_close(cur->cur);
         cur->cur = NULL;
     }
+
+    if (idxNum == 1 && idxStr &&
+        vms_plan_deserialize(idxStr, sizeof(VmsPlan), &plan)) {
+        have_plan = 1;
+    }
+    {
+        int a;
+        for (a = 0; a < VMS_PLAN_MAX_ARGS; a++) term_params[a] = 0;
+    }
+
+    if (have_plan) {
+        /* map argv values to plan order; only safe value kinds are bound.
+         * term_params[a] receives the bound value for term a (0 = none). */
+        int a;
+        for (a = 0; a < plan.nterms && a < VMS_PLAN_MAX_ARGS; a++) term_params[a] = 0;
+        for (a = 0; a < plan.nterms; a++) {
+            VmsPlanTerm* t = &plan.terms[a];
+            sqlite3_value* v = (t->arg_index >= 0 && t->arg_index < argc)
+                               ? argv[t->arg_index] : NULL;
+            if (t->op == VMS_OP_ISNULL || t->op == VMS_OP_ISNOTNULL) continue;
+            if (t->op == VMS_OP_IN) {
+                /* expand the bounded integer list via vtab_in_first/next.
+                 * Multi-value IN is NOT pushed (correctness first): it is
+                 * replaced by a contradiction marker (1=0) unless all values
+                 * are the same single integer, in which case it degrades to
+                 * equality. */
+                sqlite3_value* item = NULL;
+                long long items[64];
+                int nitems = 0;
+                int rc2 = sqlite3_vtab_in_first(v, &item);
+                while (rc2 == SQLITE_OK && item && nitems < 64) {
+                    if (sqlite3_value_numeric_type(item) == SQLITE_INTEGER) {
+                        items[nitems++] = sqlite3_value_int64(item);
+                    }
+                    rc2 = sqlite3_vtab_in_next(v, &item);
+                }
+                if (nitems == 0) {
+                    plan.terms[a].col = -1; /* marker: contradiction */
+                } else {
+                    int same = 1;
+                    int k;
+                    for (k = 1; k < nitems; k++) {
+                        if (items[k] != items[0]) { same = 0; break; }
+                    }
+                    if (!same) {
+                        plan.terms[a].col = -2; /* marker: unsatisfiable */
+                    } else {
+                        term_params[a] = items[0];
+                    }
+                }
+                continue;
+            }
+            /* comparison values must be integers (planner gated on column
+             * affinity; value affinity is re-checked here) */
+            if (v && sqlite3_value_numeric_type(v) == SQLITE_INTEGER) {
+                term_params[a] = sqlite3_value_int64(v);
+            } else {
+                /* planner omitted the constraint but the value is not an
+                 * integer: fail loudly rather than return wrong data */
+                tab->base.zErrMsg = sqlite3_mprintf(
+                    "virtualmssql: non-integer value for pushed-down "
+                    "constraint (plan/arg mismatch)");
+                return SQLITE_ERROR;
+            }
+        }
+        /* limit/offset: they occupy the tail argv slots */
+        if (plan.has_limit && plan.limit_arg >= 0 && plan.limit_arg < argc) {
+            if (sqlite3_value_numeric_type(argv[plan.limit_arg]) == SQLITE_INTEGER)
+                plan_limit = sqlite3_value_int64(argv[plan.limit_arg]);
+            else
+                plan_limit = -1;
+        }
+        if (plan.has_offset && plan.offset_arg >= 0 && plan.offset_arg < argc) {
+            if (sqlite3_value_numeric_type(argv[plan.offset_arg]) == SQLITE_INTEGER)
+                plan_offset = sqlite3_value_int64(argv[plan.offset_arg]);
+            else
+                plan_offset = 0;
+        }
+        if (plan.has_limit && plan_limit < 0) {
+            plan.has_limit = 0;
+            plan.has_offset = 0;
+        }
+    }
+
     lease = vms_pool_acquire(tab->env->pool, &tab->env->profile, &err);
     if (!lease) {
         vtab_set_error(&tab->base, &err);
         return SQLITE_ERROR;
     }
-    cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
-                               tab->cols, tab->ncols, &err);
+    if (have_plan) {
+        /* rebuild SQL from the (possibly adjusted) plan; parameter order in
+         * the SQL text is: TOP(?) first (no ORDER BY case), then WHERE ?s,
+         * then OFFSET/FETCH ?s */
+        int np = 0;
+        long long sqlparams[VMS_PLAN_MAX_ARGS];
+        int sp = 0;
+        int a;
+        if (!vms_plan_build_sql(&plan, tab->schema, tab->table,
+                                tab->cols, tab->ncols, sql, 2048, &np)) {
+            vms_pool_release(tab->env->pool, lease);
+            tab->base.zErrMsg = sqlite3_mprintf("virtualmssql: plan SQL build failed");
+            return SQLITE_ERROR;
+        }
+        /* SQL order: TOP(?) when limit and no order */
+        if (plan.has_limit && plan.norder == 0 && !plan.has_offset) {
+            sqlparams[sp++] = plan_limit;
+        }
+        for (a = 0; a < plan.nterms; a++) {
+            VmsPlanTerm* t = &plan.terms[a];
+            if (t->op == VMS_OP_ISNULL || t->op == VMS_OP_ISNOTNULL) continue;
+            if (t->col < 0) continue; /* contradiction: no parameter */
+            sqlparams[sp++] = term_params[a];
+        }
+        if (plan.has_offset && plan.norder > 0) {
+            sqlparams[sp++] = plan_offset;   /* OFFSET ? */
+            sqlparams[sp++] = plan_limit;    /* FETCH NEXT ? */
+        } else if (plan.has_limit && plan.norder > 0) {
+            sqlparams[sp++] = plan_limit;    /* FETCH NEXT ? */
+        }
+        cur->cur = vms_cursor_open_sql(lease, sql, sqlparams, sp, &err);
+    } else {
+        cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
+                                   tab->cols, tab->ncols, &err);
+    }
     /* the cursor owns its own HDBC; the pool lease connection itself is
      * returned to the pool right away (it only served as the profile
      * source) — the cursor does not hold it */
@@ -273,6 +420,19 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
     }
     cur->eof = 0;
     cur->rowid_counter = 0;
+    /* build the vtab->projection column map: build_sql emits projected
+     * columns in ascending vtab-index order */
+    {
+        int vcol, proj = 0;
+        for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++) {
+            int projected;
+            if (have_plan && plan.used_mask != 0 && plan.used_mask != -1)
+                projected = (vcol < 62) && (plan.used_mask & (1 << vcol));
+            else
+                projected = 1; /* full scan or all-columns plan */
+            cur->col_map[vcol] = projected ? proj++ : -1;
+        }
+    }
     return vms_vtab_next(cursor); /* position on the first row */
 }
 
@@ -317,13 +477,18 @@ static int vms_vtab_column(sqlite3_vtab_cursor* cursor, sqlite3_context* ctx,
                            int col)
 {
     struct VmsVtabCursor* cur = (struct VmsVtabCursor*)cursor;
+    struct VmsVtab* tab = cur->tab;
     const VmsValue* v;
 
     if (!cur->cur || cur->eof) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    v = vms_cursor_value(cur->cur, col);
+    if (col < 0 || col >= tab->ncols || cur->col_map[col] < 0) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+    v = vms_cursor_value(cur->cur, cur->col_map[col]);
     if (!v || v->type == VMS_VAL_NULL) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;

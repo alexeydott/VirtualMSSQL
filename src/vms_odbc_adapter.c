@@ -137,6 +137,10 @@ struct VmsCursor {
     VmsColumnMeta* meta;
     VmsValue* row;
     int row_ready;
+    /* R7 pushdown parameter storage (deferred binding targets) */
+    long long* param_vals;
+    SQLLEN* param_inds;
+    int nparams;
 };
 
 /* ================= value lifecycle ================= */
@@ -1150,25 +1154,26 @@ static void job_cursor_fetch(void* arg)
     }
     cur->row_ready = 1;
     op->result = 1;
+    {
+        int j;
+        for (j = 0; j < cur->col_count; j++) {
+            VmsValue* rv = &cur->row[j];
+        }
+        fflush(stderr);
+    }
 }
 
-VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
-                           const char* table, const VmsMetaColumn* cols,
-                           int ncols, VmsError* err)
+VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
+                               const long long* params, int nparams,
+                               VmsError* err)
 {
     VmsCursor* cur;
-    wchar_t sql[2048];
     OpCursorOpen open_op;
     OpCursorMeta meta_op;
-    int i;
 
     vms_error_ok(err);
-    if (!cn || !schema || !table || !cols || ncols <= 0) {
+    if (!cn || !sql) {
         vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "cursor open: bad args");
-        return NULL;
-    }
-    if (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128)) {
-        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "invalid identifier");
         return NULL;
     }
 
@@ -1190,84 +1195,27 @@ VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
         HeapFree(GetProcessHeap(), 0, cur);
         return NULL;
     }
-    {
-        /* connect the lease using the same deterministic posture; the caller
-         * passes its profile-driven connstr through the parent connection —
-         * but for R6 the lease re-uses the parent's connstr stored at open
-         * time. Simpler: the parent connection remembers its connstr. */
-    }
 
-    /* build projection: bracketed identifiers guard the SELECT shape */
-    {
-        wchar_t proj[1024];
-        size_t used = 0;
-        proj[0] = 0;
-        for (i = 0; i < ncols; i++) {
-            wchar_t colw[256];
-            int n;
-            if (!vms_meta_ident_valid(cols[i].name, 128)) {
-                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0,
-                              "invalid column name '%s'", cols[i].name);
-                vms_worker_stop(cur->worker);
-                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-                HeapFree(GetProcessHeap(), 0, cur);
-                return NULL;
-            }
-            /* bracket-quote the identifier: [name] (names are pre-validated
-             * to contain no ']' characters) */
-            n = MultiByteToWideChar(CP_UTF8, 0, cols[i].name, -1, colw + 1, 254);
-            if (n <= 0 || used + (size_t)n + 4 >= 1024) {
-                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "projection too wide");
-                vms_worker_stop(cur->worker);
-                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-                HeapFree(GetProcessHeap(), 0, cur);
-                return NULL;
-            }
-            colw[0] = L'[';
-            colw[n] = L']';
-            colw[n + 1] = 0;
-            if (i) { proj[used++] = L','; proj[used] = 0; }
-            wcscat_s(proj + used, 1024 - used, colw);
-            used += (size_t)n + 1;
-        }
-        _snwprintf_s(sql, 2048, _TRUNCATE,
-                     L"SELECT %ls FROM [%hs].[%hs]", proj, schema, table);
+    /* connect the lease from the parent's stored connstr */
+    if (!cn->last_connstr) {
+        vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
+                      "parent connection has no stored connstr for leases");
+        vms_worker_stop(cur->worker);
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
     }
-
-    /* connect + open on the lease worker */
     {
-        struct OpLease {
-            VmsCursor* cur;
-            const wchar_t* connstr;
-            VmsError* err;
-            int ok;
-        } lo;
-        lo.cur = cur;
-        lo.connstr = NULL; /* unused in R6 single-server scope */
-        lo.err = err;
-        lo.ok = 0;
-        /* The lease connection must use the same server/auth as the parent.
-         * R6 scope: the parent connection stores its connstr for reuse. */
-        if (!cn->last_connstr) {
-            vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
-                          "parent connection has no stored connstr for leases");
+        SQLRETURN r = SQLDriverConnectW(cur->hdbc, NULL,
+                                        (SQLWCHAR*)cn->last_connstr, SQL_NTS,
+                                        NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+        if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
+            int q;
+            diag_capture(err, SQL_HANDLE_DBC, cur->hdbc, "cursor lease connect", &q);
             vms_worker_stop(cur->worker);
             SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
             HeapFree(GetProcessHeap(), 0, cur);
             return NULL;
-        }
-        {
-            SQLRETURN r = SQLDriverConnectW(cur->hdbc, NULL,
-                                            (SQLWCHAR*)cn->last_connstr, SQL_NTS,
-                                            NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-            if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
-                int q;
-                diag_capture(err, SQL_HANDLE_DBC, cur->hdbc, "cursor lease connect", &q);
-                vms_worker_stop(cur->worker);
-                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-                HeapFree(GetProcessHeap(), 0, cur);
-                return NULL;
-            }
         }
     }
 
@@ -1280,12 +1228,64 @@ VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
         return NULL;
     }
 
+    /* bind integer parameters before execution; every return is checked */
+    if (nparams > 0) {
+        long long* vals;
+        SQLLEN* inds;
+        int k;
+        int bind_ok = 1;
+        vals = (long long*)HeapAlloc(GetProcessHeap(), 0, sizeof(long long) * (size_t)nparams);
+        inds = (SQLLEN*)HeapAlloc(GetProcessHeap(), 0, sizeof(SQLLEN) * (size_t)nparams);
+        if (!vals || !inds) {
+            if (vals) HeapFree(GetProcessHeap(), 0, vals);
+            if (inds) HeapFree(GetProcessHeap(), 0, inds);
+            vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM param storage");
+            SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+            SQLDisconnect(cur->hdbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            vms_worker_stop(cur->worker);
+            HeapFree(GetProcessHeap(), 0, cur);
+            return NULL;
+        }
+        /* copy: the values must outlive deferred binding; ownership moves
+         * to the cursor and is released at close */
+        for (k = 0; k < nparams; k++) {
+            SQLRETURN br;
+            vals[k] = params[k];
+            inds[k] = 0;
+            br = SQLBindParameter(cur->hstmt, (SQLUSMALLINT)(k + 1), SQL_PARAM_INPUT,
+                                  SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                                  (SQLPOINTER)(SIZE_T)&vals[k], 0, &inds[k]);
+            if (!SQL_SUCCEEDED(br)) {
+                int q;
+                diag_capture(err, SQL_HANDLE_STMT, cur->hstmt, "SQLBindParameter", &q);
+                bind_ok = 0;
+                break;
+            }
+        }
+        if (!bind_ok) {
+            HeapFree(GetProcessHeap(), 0, vals);
+            HeapFree(GetProcessHeap(), 0, inds);
+            SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+            SQLDisconnect(cur->hdbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            vms_worker_stop(cur->worker);
+            HeapFree(GetProcessHeap(), 0, cur);
+            return NULL;
+        }
+        cur->param_vals = vals;
+        cur->param_inds = inds;
+        cur->nparams = nparams;
+    }
+
     open_op.cur = cur;
     open_op.sql = sql;
     open_op.err = err;
     open_op.ok = 0;
     vms_worker_run(cur->worker, job_cursor_open, &open_op);
     if (!open_op.ok) {
+        if (cur->param_vals) HeapFree(GetProcessHeap(), 0, cur->param_vals);
+        if (cur->param_inds) HeapFree(GetProcessHeap(), 0, cur->param_inds);
         SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
         SQLDisconnect(cur->hdbc);
         SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
@@ -1324,6 +1324,8 @@ void vms_cursor_close(VmsCursor* cur)
         free(cur->row);
         cur->row = NULL;
     }
+    if (cur->param_vals) { HeapFree(GetProcessHeap(), 0, cur->param_vals); cur->param_vals = NULL; }
+    if (cur->param_inds) { HeapFree(GetProcessHeap(), 0, cur->param_inds); cur->param_inds = NULL; }
     if (cur->meta) HeapFree(GetProcessHeap(), 0, cur->meta);
     if (cur->hdbc) {
         SQLDisconnect(cur->hdbc);
@@ -1331,6 +1333,56 @@ void vms_cursor_close(VmsCursor* cur)
     }
     if (cur->worker) vms_worker_stop(cur->worker);
     HeapFree(GetProcessHeap(), 0, cur);
+}
+
+/* R6 compatibility wrapper: unparameterized full scan */
+VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
+                           const char* table, const VmsMetaColumn* cols,
+                           int ncols, VmsError* err)
+{
+    wchar_t sql[2048];
+    size_t used = 0;
+    int i;
+
+    vms_error_ok(err);
+    if (!cn || !schema || !table || !cols || ncols <= 0) {
+        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "cursor open: bad args");
+        return NULL;
+    }
+    if (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128)) {
+        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "invalid identifier");
+        return NULL;
+    }
+    {
+        wchar_t head[64];
+        wcscpy_s(sql, 2048, L"SELECT ");
+        used = wcslen(sql);
+        for (i = 0; i < ncols; i++) {
+            wchar_t colw[256];
+            int n;
+            if (!vms_meta_ident_valid(cols[i].name, 128)) {
+                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0,
+                              "invalid column name '%s'", cols[i].name);
+                return NULL;
+            }
+            n = MultiByteToWideChar(CP_UTF8, 0, cols[i].name, -1, colw + 1, 254);
+            if (n <= 0 || used + (size_t)n + 4 >= 2048) {
+                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "projection too wide");
+                return NULL;
+            }
+            colw[0] = L'[';
+            colw[n] = L']';
+            colw[n + 1] = 0;
+            if (i) { sql[used++] = L','; sql[used] = 0; }
+            wcscat_s(sql + used, 2048 - used, colw);
+            used += (size_t)n + 1;
+        }
+        _snwprintf_s(head, 64, _TRUNCATE, L"");
+        (void)head;
+    }
+    _snwprintf_s(sql + used, 2048 - used, _TRUNCATE,
+                 L" FROM [%hs].[%hs]", schema, table);
+    return vms_cursor_open_sql(cn, sql, NULL, 0, err);
 }
 
 int vms_cursor_fetch(VmsCursor* cur, VmsError* err)

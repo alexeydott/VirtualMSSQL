@@ -25,6 +25,7 @@ add_library(vms_client STATIC
     src/vms_connstr.c
     src/vms_pool.c
     src/vms_meta.c
+    src/vms_plan.c
     src/vms_vtab.c
 )
 target_include_directories(vms_client PUBLIC
@@ -70,3 +71,4 @@ target_compile_options(virtualmssql PRIVATE /W4)
 # ---- tests (R1.4) ----
 enable_testing()
 add_subdirectory(tests)
+

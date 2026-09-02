@@ -126,10 +126,15 @@ typedef struct VmsCursor VmsCursor;
 
 /* open a cursor streaming "SELECT <quoted column list> FROM <quoted table>"
  * built from validated identifiers; each cursor holds its own pool lease
- * for the duration of the scan. */
+ * for the duration of the scan. params/nparams carry the R7 pushdown
+ * values (int64 equality/range/IN/limit/offset in plan order). */
 VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
                            const char* table, const VmsMetaColumn* cols,
                            int ncols, VmsError* err);
+/* open with an explicit remote SQL statement and bound integer params. */
+VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
+                               const long long* params, int nparams,
+                               VmsError* err);
 void vms_cursor_close(VmsCursor* cur);
 /* fetch next row: 1 = row ready (fully decoded), 0 = end, -1 = error */
 int vms_cursor_fetch(VmsCursor* cur, VmsError* err);

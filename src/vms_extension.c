@@ -278,8 +278,7 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
     if (g_profile_spec[0] || getenv("VMS_TEST_PROFILE")) {
         char* vtab_err = NULL;
         if (vms_vtab_env_init(db, &vtab_err) != SQLITE_OK) {
-            /* non-fatal: diagnostic printed; profile scalar can retry */
-                    vtab_err ? vtab_err : "?");
+            /* non-fatal: profile scalar can retry */
             g_profile_db = db;
             if (vtab_err) sqlite3_free(vtab_err);
         }

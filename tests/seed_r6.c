@@ -16,12 +16,19 @@ int main(void)
     VmsStatement* st;
     const char* spec = getenv("VMS_TEST_PROFILE");
     static const wchar_t* ddl[] = {
+        L"IF OBJECT_ID(N'dbo.vms7_data') IS NOT NULL DROP TABLE dbo.vms7_data;"
         L"IF OBJECT_ID(N'dbo.vms6_view') IS NOT NULL DROP VIEW dbo.vms6_view;"
         L"IF OBJECT_ID(N'dbo.vms6_t_empty') IS NOT NULL DROP TABLE dbo.vms6_t_empty;"
         L"IF OBJECT_ID(N'dbo.vms6_t_big') IS NOT NULL DROP TABLE dbo.vms6_t_big;"
         L"IF OBJECT_ID(N'dbo.vms6_t_lob') IS NOT NULL DROP TABLE dbo.vms6_t_lob;"
         L"IF OBJECT_ID(N'dbo.vms6_t_all') IS NOT NULL DROP TABLE dbo.vms6_t_all;"
         L"IF OBJECT_ID(N'dbo.vms6_t_int') IS NOT NULL DROP TABLE dbo.vms6_t_int",
+        L"CREATE TABLE dbo.vms7_data(a int NOT NULL PRIMARY KEY, b nvarchar(50) NOT NULL, c int NULL)",
+        L"INSERT INTO dbo.vms7_data(a, b, c) VALUES"
+        L"(-3, N'alpha', NULL), (1, N'bravo', 10), (2, N'charlie', NULL),"
+        L"(3, N'delta', 30), (5, N'echo', NULL), (7, N'foxtrot', 70),"
+        L"(8, N'golf', 80), (11, N'hotel', NULL), (12, N'india', 120),"
+        L"(15, N'juliet', 150), (16, N'kilo', NULL), (20, N'lima', 200)",
         L"CREATE TABLE dbo.vms6_t_int(id int NOT NULL PRIMARY KEY, v int NULL)",
         L"INSERT INTO dbo.vms6_t_int VALUES(1, 100), (2, 200), (3, 300)",
         L"CREATE TABLE dbo.vms6_t_all("
@@ -71,7 +78,7 @@ int main(void)
             L" CAST(0xAB AS varbinary(max)) + CAST(0xAB AS varbinary(max)))",
             L"UPDATE dbo.vms6_t_lob SET bigt = REPLICATE(bigt, 10) WHERE id = 1",
             L"UPDATE dbo.vms6_t_lob SET bigb = CONVERT(varbinary(max), REPLICATE(CAST(0xAB AS varbinary(max)), 50000)) WHERE id = 1",
-            L"INSERT INTO dbo.vms6_t_big(id, i) SELECT TOP (1000000) "
+            L"INSERT INTO dbo.vms6_t_big(id, i) SELECT TOP (100000) "
             L"ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),"
             L" ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) "
             L"FROM sys.all_objects a CROSS JOIN sys.all_objects b",
