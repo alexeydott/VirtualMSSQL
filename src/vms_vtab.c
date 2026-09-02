@@ -11,6 +11,7 @@
 #include "vms_vtab.h"
 #include "vms_meta.h"
 #include "vms_plan.h"
+#include "vms_query_source.h"
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,6 +30,10 @@ struct VmsVtab {
     char table[128];
     int ncols;
     VmsMetaColumn* cols;   /* metadata flavor (name/type_name/vtype/...) */
+    /* R8: query source mode */
+    int is_query_source;
+    VmsQuerySource qsrc;
+    char query_spec[32768];
 };
 
 struct VmsVtab;
@@ -68,11 +73,13 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     VmsError err;
     const char* schema = NULL;
     const char* table = NULL;
-    char schema_buf[128], table_buf[128];
+    const char* query = NULL;
+    char schema_buf[128], table_buf[128], query_buf[32768];
     char decl[4096];
     size_t dlen = 0;
     int i;
     int rc = SQLITE_ERROR;
+    int is_query = 0;
 
     (void)argc;
     if (!g_env) {
@@ -87,30 +94,50 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
             schema = a + 7;
         } else if (!strncmp(a, "table=", 6)) {
             table = a + 6;
+        } else if (!strncmp(a, "source=", 7)) {
+            const char* sv = a + 7;
+            if (sv[0] == '\'') sv++; /* strip leading quote */
+            if (strncmp(sv, "query", 5) && strncmp(sv, "table", 5)) {
+                *pzErr = sqlite3_mprintf("virtualmssql: source must be 'table' or 'query'");
+                return SQLITE_ERROR;
+            }
+            is_query = !strncmp(sv, "query", 5);
+        } else if (!strncmp(a, "query=", 6)) {
+            query = a + 6;
         } else {
             *pzErr = sqlite3_mprintf("virtualmssql: unknown argument '%s'", a);
             return SQLITE_ERROR;
         }
     }
-    if (!schema || !table) {
+    if (is_query && !query) {
+        *pzErr = sqlite3_mprintf("virtualmssql: source=query requires query='...'");
+        return SQLITE_ERROR;
+    }
+    if (!is_query && (!schema || !table)) {
         *pzErr = sqlite3_mprintf("virtualmssql: schema= and table= are required");
         return SQLITE_ERROR;
     }
     /* strip surrounding quotes from args */
     {
         size_t n;
-        if (schema[0] == '\'' && (n = strlen(schema)) >= 2 && schema[n-1] == '\'') {
+        if (schema && schema[0] == '\'' && (n = strlen(schema)) >= 2 && schema[n-1] == '\'') {
             memcpy(schema_buf, schema + 1, n - 2);
             schema_buf[n - 2] = 0;
             schema = schema_buf;
         }
-        if (table[0] == '\'' && (n = strlen(table)) >= 2 && table[n-1] == '\'') {
+        if (table && table[0] == '\'' && (n = strlen(table)) >= 2 && table[n-1] == '\'') {
             memcpy(table_buf, table + 1, n - 2);
             table_buf[n - 2] = 0;
             table = table_buf;
         }
+        if (query && query[0] == '\'' && (n = strlen(query)) >= 2 && query[n-1] == '\'') {
+            memcpy(query_buf, query + 1, n - 2);
+            query_buf[n - 2] = 0;
+            query = query_buf;
+        }
     }
-    if (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128)) {
+    if (!is_query &&
+        (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128))) {
         *pzErr = sqlite3_mprintf("virtualmssql: invalid identifier");
         return SQLITE_ERROR;
     }
@@ -120,10 +147,15 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     if (!tab) return SQLITE_NOMEM;
     memset(tab, 0, sizeof(*tab));
     tab->env = g_env;
-    strncpy_s(tab->schema, sizeof(tab->schema), schema, _TRUNCATE);
-    strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
+    tab->is_query_source = is_query;
+    if (is_query) {
+        strncpy_s(tab->query_spec, sizeof(tab->query_spec), query, _TRUNCATE);
+    } else {
+        strncpy_s(tab->schema, sizeof(tab->schema), schema, _TRUNCATE);
+        strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
+    }
 
-    /* discover the shape through the catalog (R5) via a pool lease */
+    /* discover the shape through a pool lease */
     {
         VmsConnection* probe = vms_pool_acquire(g_env->pool, &g_env->profile, &err);
         if (!probe) {
@@ -131,8 +163,16 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
             sqlite3_free(tab);
             return SQLITE_ERROR;
         }
-        if (!vms_meta_columns(probe, schema, table, &cols, &err)) {
-            vtab_set_error(NULL, &err);
+        if (is_query) {
+            /* R8: validate + describe via sp_describe_first_result_set */
+            if (!vms_query_source_prepare(probe, query, &tab->qsrc, &err)) {
+                *pzErr = sqlite3_mprintf("virtualmssql: query rejected: %s", err.message);
+                vms_pool_release(g_env->pool, probe);
+                sqlite3_free(tab);
+                return SQLITE_ERROR;
+            }
+            cols.count = 0; /* shape comes from qsrc */
+        } else if (!vms_meta_columns(probe, schema, table, &cols, &err)) {
             *pzErr = sqlite3_mprintf("virtualmssql: metadata read failed: %s", err.message);
             vms_pool_release(g_env->pool, probe);
             sqlite3_free(tab);
@@ -140,25 +180,26 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         }
         vms_pool_release(g_env->pool, probe);
     }
-    if (cols.count < 1 || cols.count > 512) {
-        *pzErr = sqlite3_mprintf("virtualmssql: table has %d columns (unsupported)",
-                                 cols.count);
+    tab->ncols = is_query ? tab->qsrc.ncols : cols.count;
+    if (tab->ncols < 1 || tab->ncols > 512) {
+        *pzErr = sqlite3_mprintf("virtualmssql: object has %d columns (unsupported)",
+                                 tab->ncols);
         sqlite3_free(tab);
         return SQLITE_ERROR;
     }
-    tab->ncols = cols.count;
     tab->cols = (VmsMetaColumn*)sqlite3_malloc(sizeof(VmsMetaColumn) * (size_t)tab->ncols);
     if (!tab->cols) {
         sqlite3_free(tab);
         return SQLITE_NOMEM;
     }
-    memcpy(tab->cols, cols.cols, sizeof(VmsMetaColumn) * (size_t)tab->ncols);
-    /* persist the identifiers: they pointed at stack buffers above */
-    strncpy_s(tab->schema, sizeof(tab->schema), schema, _TRUNCATE);
-    strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
-    for (i = 0; i < tab->ncols; i++) {
+    if (is_query) {
+        memcpy(tab->cols, tab->qsrc.cols, sizeof(VmsMetaColumn) * (size_t)tab->ncols);
+    } else {
+        memcpy(tab->cols, cols.cols, sizeof(VmsMetaColumn) * (size_t)tab->ncols);
+        /* persist the identifiers: they pointed at stack buffers above */
+        strncpy_s(tab->schema, sizeof(tab->schema), schema, _TRUNCATE);
+        strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
     }
-    fflush(stderr);
 
     /* declare schema: SQL Server type -> SQLite affinity via registry.
      * declare_vtab requires a full CREATE TABLE statement. */
@@ -205,6 +246,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
 static int vms_vtab_disconnect(sqlite3_vtab* vtab)
 {
     struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    if (tab->is_query_source) vms_query_source_free(&tab->qsrc);
     if (tab->cols) sqlite3_free(tab->cols);
     sqlite3_free(tab);
     return SQLITE_OK;
@@ -218,7 +260,14 @@ static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
     VmsPlan plan;
     char buf[sizeof(VmsPlan)];
 
-    (void)vtab;
+    /* R8: query sources run full scans only (pushdown into an arbitrary
+     * SELECT is deferred; the outer wrapper already guarantees the shape) */
+    if (tab->is_query_source) {
+        info->estimatedCost = 100000.0;
+        info->estimatedRows = 1000;
+        info->idxNum = 2; /* query source full scan */
+        return SQLITE_OK;
+    }
     if (!vms_plan_compile(info, tab->cols, tab->ncols, &plan)) {
         info->estimatedCost = 1000000.0;
         info->estimatedRows = 100000;
@@ -287,7 +336,7 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         cur->cur = NULL;
     }
 
-    if (idxNum == 1 && idxStr &&
+    if (idxNum == 1 && idxStr && !tab->is_query_source &&
         vms_plan_deserialize(idxStr, sizeof(VmsPlan), &plan)) {
         have_plan = 1;
     }
@@ -374,6 +423,31 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
     if (!lease) {
         vtab_set_error(&tab->base, &err);
         return SQLITE_ERROR;
+    }
+    if (tab->is_query_source) {
+        /* R8: validated query scan — no pushdown in this mode; the query is
+         * used as-is (a WITH head is legal at statement level but not inside
+         * a derived table, so no outer wrapper is applied) */
+        wchar_t qsql[34816];
+        if (!vms_query_source_get_sql(&tab->qsrc, qsql, 34816)) {
+            vms_pool_release(tab->env->pool, lease);
+            tab->base.zErrMsg = sqlite3_mprintf("virtualmssql: query copy failed");
+            return SQLITE_ERROR;
+        }
+        cur->cur = vms_cursor_open_sql(lease, qsql, NULL, 0, &err);
+        vms_pool_release(tab->env->pool, lease);
+        if (!cur->cur) {
+            vtab_set_error(&tab->base, &err);
+            return SQLITE_ERROR;
+        }
+        cur->eof = 0;
+        cur->rowid_counter = 0;
+        {
+            int vcol;
+            for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++)
+                cur->col_map[vcol] = vcol; /* full projection */
+        }
+        return vms_vtab_next(cursor);
     }
     if (have_plan) {
         /* rebuild SQL from the (possibly adjusted) plan; parameter order in
