@@ -35,3 +35,23 @@ host application
 - `EXPERIMENTAL` — не блокирует 1.0 и должен развиваться отдельно.
 - `UNSUPPORTED` — должен завершаться детерминированной ошибкой, а не работать «best effort».
 
+## Реализация (статус по этапам)
+
+- **R0 — ODBC feasibility probe: Gate G0 PASS** (2026-09-01). Пробник `tools/vms-odbc-probe`, результаты: `docs/research/r0-probe-results.md`. Ключевые находки: потолок параметров 1999; отмена только через `SQLCancelHandle(SQL_HANDLE_STMT)` на публикуемый воркером statement; `ColumnSize=0` запрещён для LONG-параметров (HY104, рабочий максимум `2^30-1`); ленивое начало транзакции подтверждено; `SQL_COPT_SS_AUTOBEGINTXN = 1402`.
+- **R1 — репозиторий/сборка/совместимость: Gate G1 PASS** (2026-09-01). `virtualmssql.dll` собирается в 4 конфигурациях (win32/x64 × debug/release, CMake + Ninja, `/W4`); экспорты `sqlite3_virtualmssql_init` + `sqlite3_extension_init`; runtime-гейт версии SQLite (baseline 3.44.0, без silent downgrade); стаб-модуль `virtualmssql_stub` + скаляр `virtualmssql_version()`; CTest-сьюты load/exports/capability/missing-driver — 4/4 PASS на всех конфигурациях; загрузка проверена через официальный sqlite3 CLI 3.53.4.
+- **R2 — foundation core: Gate G2 PASS** (2026-09-01). Checked arithmetic (`vms_add_sz/mul_sz/add_i64/mul_i64` — все переполнения ловятся на обеих архитектурах); bounded-буферы с zero-on-free; UTF-8/UTF-16 с явными границами и отказом на invalid encoding (кириллица, non-BMP surrogate pairs, lone surrogates); ресурс-лимиты (10 `max_*`, дефолт `max_parameters=1999` по данным R0, понижение-only); логирование с безусловной redaction секретов (`PWD=`, `password=` — case-insensitive, утечка в sink невозможна); versioned fingerprints (FNV-1a, соление stage-тегом); fault allocator (OOM-инъекция в bounded-buffer путь). CTest `foundation` — PASS на всех 4 конфигурациях.
+- **R3 — ODBC client runtime: Gate G3 PASS** (2026-09-02). Портативный слой `vms_client.h` (`VmsClient/Connection/Statement/Value/ColumnMeta/Error`) без единого ODBC-типа; весь ODBC изолирован в адаптере `vms_odbc_adapter.c` + connection-affine воркер `vms_odbc_worker.c` (один владелец HDBC/HSTMT, сериализация всех вызовов). Инварианты ТЗ подтверждены тестами: полная декодировка строки до видимости; инкрементные ординалы SQLGetData; `SQL_NO_DATA` как успех; статус-классификация (TRANSPORT→quarantine, HY008→CANCELLED); drain через `SQLMoreResults`; `vms_tran_begin/commit/rollback`; cross-thread cancel `vms_conn_cancel` (sqlite3_interrupt-семантика, `SQLCancelHandle(SQL_HANDLE_STMT)` — схема R0) с восстановлением соединения после отмены. Интеграционная сьюта `test_client` против SQL Server 2022 — PASS на всех 4 конфигурациях (6/6×4).
+
+### Быстрая сборка
+
+```powershell
+# из окружения "vcvarsall x64" (или x86 для Win32-конфигураций)
+cmake --preset x64-release
+cmake --build --preset x64-release
+ctest --preset x64-release
+```
+
+Скрипт-обёртка: `scripts/build-and-test.ps1 -Arch x64 -Config release`.
+
+SQLite для тестов (официальные прекомпилированные DLL 3.53.4) лежит в `third_party/bin/{x64,x86}` — в release-артефакт не входит.
+

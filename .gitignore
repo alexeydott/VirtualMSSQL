@@ -18,3 +18,10 @@ opencode.json
 build/
 out/
 *.user
+*.obj
+*.pdb
+*.exp
+
+# probe leftovers
+probe-*.json
+probe-*.log

@@ -1,0 +1,79 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 20,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "win-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "x64-debug",
+            "inherits": "win-base",
+            "displayName": "x64 Debug (MSVC, needs vcvarsall x64)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "x64-release",
+            "inherits": "win-base",
+            "displayName": "x64 Release (MSVC, needs vcvarsall x64)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "win32-debug",
+            "inherits": "win-base",
+            "displayName": "Win32 Debug (MSVC, needs vcvarsall x86)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "win32-release",
+            "inherits": "win-base",
+            "displayName": "Win32 Release (MSVC, needs vcvarsall x86)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "x64-debug", "configurePreset": "x64-debug" },
+        { "name": "x64-release", "configurePreset": "x64-release" },
+        { "name": "win32-debug", "configurePreset": "win32-debug" },
+        { "name": "win32-release", "configurePreset": "win32-release" }
+    ],
+    "testPresets": [
+        {
+            "name": "x64-debug",
+            "configurePreset": "x64-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "x64-release",
+            "configurePreset": "x64-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "win32-debug",
+            "configurePreset": "win32-debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "win32-release",
+            "configurePreset": "win32-release",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}
