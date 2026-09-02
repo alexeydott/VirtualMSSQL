@@ -12,6 +12,7 @@
 #include "vms_meta.h"
 #include "vms_plan.h"
 #include "vms_query_source.h"
+#include "vms_mat.h"
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
@@ -34,6 +35,9 @@ struct VmsVtab {
     int is_query_source;
     VmsQuerySource qsrc;
     char query_spec[32768];
+    /* R9: materialization (query sources only) */
+    VmsMatMode mat_mode;
+    VmsMat* mat;           /* published snapshot; guarded by SQLite core */
 };
 
 struct VmsVtab;
@@ -44,6 +48,9 @@ struct VmsVtabCursor {
     VmsCursor* cur;     /* lease; NULL when the scan finished/closed early */
     int eof;
     sqlite3_int64 rowid_counter;
+    /* R9 snapshot scan state */
+    sqlite3* snapshot_db;
+    sqlite3_stmt* snapshot_stmt;
     /* R7: map vtab column index -> position in the remote projection.
      * -1 = column not projected (xColumn must not read it, but SQLite only
      * calls xColumn for colUsed columns which are all projected). */
@@ -80,6 +87,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     int i;
     int rc = SQLITE_ERROR;
     int is_query = 0;
+    int mat_mode_parsed = VMS_MAT_OFF;
 
     (void)argc;
     if (!g_env) {
@@ -104,6 +112,21 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
             is_query = !strncmp(sv, "query", 5);
         } else if (!strncmp(a, "query=", 6)) {
             query = a + 6;
+        } else if (!strncmp(a, "materialization=", 16)) {
+            const char* mv = a + 16;
+            char mvbuf[32];
+            size_t n;
+            if (mv[0] == '\'') mv++; /* strip leading quote */
+            n = strlen(mv);
+            if (n > 0 && mv[n - 1] == '\'') n--; /* strip trailing quote */
+            if (n >= sizeof(mvbuf)) n = sizeof(mvbuf) - 1;
+            memcpy(mvbuf, mv, n);
+            mvbuf[n] = 0;
+            mat_mode_parsed = vms_mat_mode_parse(mvbuf);
+            if (mat_mode_parsed < 0) {
+                *pzErr = sqlite3_mprintf("virtualmssql: materialization must be off|memory|temp");
+                return SQLITE_ERROR;
+            }
         } else {
             *pzErr = sqlite3_mprintf("virtualmssql: unknown argument '%s'", a);
             return SQLITE_ERROR;
@@ -187,6 +210,9 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         sqlite3_free(tab);
         return SQLITE_ERROR;
     }
+    if (is_query) {
+        tab->mat_mode = (VmsMatMode)mat_mode_parsed;
+    }
     tab->cols = (VmsMetaColumn*)sqlite3_malloc(sizeof(VmsMetaColumn) * (size_t)tab->ncols);
     if (!tab->cols) {
         sqlite3_free(tab);
@@ -247,6 +273,7 @@ static int vms_vtab_disconnect(sqlite3_vtab* vtab)
 {
     struct VmsVtab* tab = (struct VmsVtab*)vtab;
     if (tab->is_query_source) vms_query_source_free(&tab->qsrc);
+    if (tab->mat) vms_mat_destroy(tab->mat);
     if (tab->cols) sqlite3_free(tab->cols);
     sqlite3_free(tab);
     return SQLITE_OK;
@@ -311,6 +338,11 @@ static int vms_vtab_close(sqlite3_vtab_cursor* cursor)
         vms_cursor_close(cur->cur);
         cur->cur = NULL;
     }
+    if (cur->snapshot_stmt) {
+        sqlite3_finalize(cur->snapshot_stmt);
+        cur->snapshot_stmt = NULL;
+    }
+    cur->snapshot_db = NULL;
     sqlite3_free(cur);
     return SQLITE_OK;
 }
@@ -425,29 +457,79 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         return SQLITE_ERROR;
     }
     if (tab->is_query_source) {
-        /* R8: validated query scan — no pushdown in this mode; the query is
-         * used as-is (a WITH head is legal at statement level but not inside
-         * a derived table, so no outer wrapper is applied) */
-        wchar_t qsql[34816];
-        if (!vms_query_source_get_sql(&tab->qsrc, qsql, 34816)) {
+        /* R9 materialized mode: build once, then read from the private db.
+         * Build happens inside xFilter on first scan; a FAILED build
+         * propagates the error; partial snapshots are never published
+         * (vms_mat_build flips to PUBLISHED only on full success). */
+        if (tab->mat_mode != VMS_MAT_OFF) {
+            if (!tab->mat) {
+                tab->mat = vms_mat_create(tab->mat_mode, 0, 0);
+                if (!tab->mat) {
+                    vms_pool_release(tab->env->pool, lease);
+                    tab->base.zErrMsg = sqlite3_mprintf(
+                        "virtualmssql: materializer init failed");
+                    return SQLITE_ERROR;
+                }
+                if (!vms_mat_build(tab->mat, lease, &tab->qsrc, &err)) {
+                    vms_mat_destroy(tab->mat);
+                    tab->mat = NULL;
+                    vms_pool_release(tab->env->pool, lease);
+                    vtab_set_error(&tab->base, &err);
+                    return SQLITE_ERROR;
+                }
+            }
             vms_pool_release(tab->env->pool, lease);
-            tab->base.zErrMsg = sqlite3_mprintf("virtualmssql: query copy failed");
-            return SQLITE_ERROR;
+            /* snapshot scan: rows come from the private published db */
+            cur->snapshot_db = vms_mat_db(tab->mat);
+            cur->snapshot_stmt = NULL;
+            if (cur->snapshot_db) {
+                char q[256];
+                sqlite3_stmt* st = NULL;
+                _snprintf_s(q, sizeof(q), _TRUNCATE,
+                            "SELECT * FROM %s", vms_mat_table_name());
+                if (sqlite3_prepare_v2(cur->snapshot_db, q, -1, &st, NULL) == SQLITE_OK) {
+                    cur->snapshot_stmt = st;
+                } else {
+                    cur->snapshot_db = NULL;
+                    tab->base.zErrMsg = sqlite3_mprintf(
+                        "virtualmssql: snapshot read failed");
+                    return SQLITE_ERROR;
+                }
+            }
+            cur->eof = 0;
+            cur->rowid_counter = 0;
+            {
+                int vcol;
+                for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++)
+                    cur->col_map[vcol] = vcol;
+            }
+            return vms_vtab_next(cursor);
         }
-        cur->cur = vms_cursor_open_sql(lease, qsql, NULL, 0, &err);
-        vms_pool_release(tab->env->pool, lease);
-        if (!cur->cur) {
-            vtab_set_error(&tab->base, &err);
-            return SQLITE_ERROR;
-        }
-        cur->eof = 0;
-        cur->rowid_counter = 0;
+        /* R8 streaming mode: validated query scan — no pushdown in this
+         * mode; the query is used as-is (a WITH head is legal at statement
+         * level but not inside a derived table, so no outer wrapper) */
         {
-            int vcol;
-            for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++)
-                cur->col_map[vcol] = vcol; /* full projection */
+            wchar_t qsql[34816];
+            if (!vms_query_source_get_sql(&tab->qsrc, qsql, 34816)) {
+                vms_pool_release(tab->env->pool, lease);
+                tab->base.zErrMsg = sqlite3_mprintf("virtualmssql: query copy failed");
+                return SQLITE_ERROR;
+            }
+            cur->cur = vms_cursor_open_sql(lease, qsql, NULL, 0, &err);
+            vms_pool_release(tab->env->pool, lease);
+            if (!cur->cur) {
+                vtab_set_error(&tab->base, &err);
+                return SQLITE_ERROR;
+            }
+            cur->eof = 0;
+            cur->rowid_counter = 0;
+            {
+                int vcol;
+                for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++)
+                    cur->col_map[vcol] = vcol; /* full projection */
+            }
+            return vms_vtab_next(cursor);
         }
-        return vms_vtab_next(cursor);
     }
     if (have_plan) {
         /* rebuild SQL from the (possibly adjusted) plan; parameter order in
@@ -513,32 +595,48 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
 static int vms_vtab_next(sqlite3_vtab_cursor* cursor)
 {
     struct VmsVtabCursor* cur = (struct VmsVtabCursor*)cursor;
-    VmsError err;
-    int r;
+
+    /* R9 snapshot path */
+    if (cur->snapshot_stmt) {
+        int rc = sqlite3_step(cur->snapshot_stmt);
+        if (rc == SQLITE_ROW) {
+            cur->eof = 0;
+            cur->rowid_counter++;
+            return SQLITE_OK;
+        }
+        cur->eof = 1;
+        sqlite3_finalize(cur->snapshot_stmt);
+        cur->snapshot_stmt = NULL;
+        return rc == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    }
 
     if (!cur->cur) {
         cur->eof = 1;
         return SQLITE_OK;
     }
-    memset(&err, 0, sizeof(err));
-    r = vms_cursor_fetch(cur->cur, &err);
-    if (r < 0) {
-        vtab_set_error(&cur->tab->base, &err);
-        /* the scan is broken: retire the lease */
-        vms_cursor_close(cur->cur);
-        cur->cur = NULL;
-        cur->eof = 1;
-        return SQLITE_ERROR;
+    {
+        VmsError err;
+        int r;
+        memset(&err, 0, sizeof(err));
+        r = vms_cursor_fetch(cur->cur, &err);
+        if (r < 0) {
+            vtab_set_error(&cur->tab->base, &err);
+            /* the scan is broken: retire the lease */
+            vms_cursor_close(cur->cur);
+            cur->cur = NULL;
+            cur->eof = 1;
+            return SQLITE_ERROR;
+        }
+        if (r == 0) {
+            cur->eof = 1;
+            /* scan complete: release the lease promptly */
+            vms_cursor_close(cur->cur);
+            cur->cur = NULL;
+            return SQLITE_OK;
+        }
+        cur->eof = 0;
+        cur->rowid_counter++;
     }
-    if (r == 0) {
-        cur->eof = 1;
-        /* scan complete: release the lease promptly */
-        vms_cursor_close(cur->cur);
-        cur->cur = NULL;
-        return SQLITE_OK;
-    }
-    cur->eof = 0;
-    cur->rowid_counter++;
     return SQLITE_OK;
 }
 
@@ -552,37 +650,70 @@ static int vms_vtab_column(sqlite3_vtab_cursor* cursor, sqlite3_context* ctx,
 {
     struct VmsVtabCursor* cur = (struct VmsVtabCursor*)cursor;
     struct VmsVtab* tab = cur->tab;
-    const VmsValue* v;
+
+    /* R9 snapshot path */
+    if (cur->snapshot_stmt) {
+        int c = cur->col_map[col];
+        if (cur->eof || c < 0 || c >= sqlite3_column_count(cur->snapshot_stmt)) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+        switch (sqlite3_column_type(cur->snapshot_stmt, c)) {
+        case SQLITE_INTEGER:
+            sqlite3_result_int64(ctx, sqlite3_column_int64(cur->snapshot_stmt, c));
+            break;
+        case SQLITE_FLOAT:
+            sqlite3_result_double(ctx, sqlite3_column_double(cur->snapshot_stmt, c));
+            break;
+        case SQLITE_TEXT:
+            sqlite3_result_text(ctx, (const char*)sqlite3_column_text(cur->snapshot_stmt, c),
+                                sqlite3_column_bytes(cur->snapshot_stmt, c),
+                                SQLITE_TRANSIENT);
+            break;
+        case SQLITE_BLOB:
+            sqlite3_result_blob(ctx, sqlite3_column_blob(cur->snapshot_stmt, c),
+                                sqlite3_column_bytes(cur->snapshot_stmt, c),
+                                SQLITE_TRANSIENT);
+            break;
+        default:
+            sqlite3_result_null(ctx);
+            break;
+        }
+        return SQLITE_OK;
+    }
 
     if (!cur->cur || cur->eof) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    if (col < 0 || col >= tab->ncols || cur->col_map[col] < 0) {
-        sqlite3_result_null(ctx);
-        return SQLITE_OK;
-    }
-    v = vms_cursor_value(cur->cur, cur->col_map[col]);
-    if (!v || v->type == VMS_VAL_NULL) {
-        sqlite3_result_null(ctx);
-        return SQLITE_OK;
-    }
-    switch (v->type) {
-    case VMS_VAL_INT64:
-        sqlite3_result_int64(ctx, (sqlite3_int64)v->i);
-        break;
-    case VMS_VAL_FLOAT64:
-        sqlite3_result_double(ctx, v->f);
-        break;
-    case VMS_VAL_TEXT:
-        sqlite3_result_text(ctx, v->text, (int)v->text_len, SQLITE_TRANSIENT);
-        break;
-    case VMS_VAL_BLOB:
-        sqlite3_result_blob(ctx, v->blob, (int)v->blob_len, SQLITE_TRANSIENT);
-        break;
-    default:
-        sqlite3_result_null(ctx);
-        break;
+    {
+        const VmsValue* v;
+        if (col < 0 || col >= tab->ncols || cur->col_map[col] < 0) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+        v = vms_cursor_value(cur->cur, cur->col_map[col]);
+        if (!v || v->type == VMS_VAL_NULL) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+        switch (v->type) {
+        case VMS_VAL_INT64:
+            sqlite3_result_int64(ctx, (sqlite3_int64)v->i);
+            break;
+        case VMS_VAL_FLOAT64:
+            sqlite3_result_double(ctx, v->f);
+            break;
+        case VMS_VAL_TEXT:
+            sqlite3_result_text(ctx, v->text, (int)v->text_len, SQLITE_TRANSIENT);
+            break;
+        case VMS_VAL_BLOB:
+            sqlite3_result_blob(ctx, v->blob, (int)v->blob_len, SQLITE_TRANSIENT);
+            break;
+        default:
+            sqlite3_result_null(ctx);
+            break;
+        }
     }
     return SQLITE_OK;
 }
