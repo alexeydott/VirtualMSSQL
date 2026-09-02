@@ -15,6 +15,9 @@
 
 #include "vms_error.h"
 
+/* metadata column flavor lives in vms_meta.h; the cursor API takes it */
+typedef struct VmsMetaColumn VmsMetaColumn;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -114,6 +117,27 @@ int vms_tran_rollback(VmsConnection* cn, VmsError* err);
  * @@TRANCOUNT == 0, SELECT 1 round-trip works. 1 = clean.
  * Connection reuse is allowed only with a proven clean state. */
 int vms_conn_verify(VmsConnection* cn);
+
+/* ---- vtab read cursor (R6) ----
+ * A cursor is an independent lease over its own ODBC connection lease:
+ * two cursors scan concurrently (SQLite nested scans) without sharing
+ * statement handles. Rows stream through the cursor's own worker. */
+typedef struct VmsCursor VmsCursor;
+
+/* open a cursor streaming "SELECT <quoted column list> FROM <quoted table>"
+ * built from validated identifiers; each cursor holds its own pool lease
+ * for the duration of the scan. */
+VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
+                           const char* table, const VmsMetaColumn* cols,
+                           int ncols, VmsError* err);
+void vms_cursor_close(VmsCursor* cur);
+/* fetch next row: 1 = row ready (fully decoded), 0 = end, -1 = error */
+int vms_cursor_fetch(VmsCursor* cur, VmsError* err);
+/* cancel the scan from any thread (sqlite3_interrupt path) */
+int vms_cursor_cancel(VmsCursor* cur);
+int vms_cursor_col_count(const VmsCursor* cur);
+const VmsColumnMeta* vms_cursor_meta(const VmsCursor* cur, int col);
+const VmsValue* vms_cursor_value(const VmsCursor* cur, int col);
 
 #ifdef __cplusplus
 }

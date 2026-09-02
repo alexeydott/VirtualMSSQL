@@ -6,6 +6,7 @@
  * published active statement (R0-proven scheme).
  * Rows become visible only after complete decode of every column. */
 #include "vms_client.h"
+#include "vms_meta.h"
 #include "vms_foundation.h"
 #include "vms_odbc_worker.h"
 #include <windows.h>
@@ -113,6 +114,7 @@ struct VmsConnection {
     HDBC hdbc;              /* single owner: this object */
     VmsWorker* worker;
     volatile LONG quarantined;
+    wchar_t* last_connstr;  /* kept for cursor leases (R6) */
 };
 
 struct VmsStatement {
@@ -124,12 +126,25 @@ struct VmsStatement {
     int row_ready;
 };
 
+/* R6 read cursor: independent lease = its own HDBC + worker, so nested
+ * SQLite scans stream in parallel over their own connections. */
+struct VmsCursor {
+    HDBC hdbc;              /* owned lease */
+    VmsWorker* worker;
+    HSTMT hstmt;            /* single owner: this object */
+    volatile LONG closed;
+    int col_count;
+    VmsColumnMeta* meta;
+    VmsValue* row;
+    int row_ready;
+};
+
 /* ================= value lifecycle ================= */
 
 static void value_clear(VmsValue* v)
 {
-    if (v->text) { HeapFree(GetProcessHeap(), 0, v->text); v->text = NULL; }
-    if (v->blob) { HeapFree(GetProcessHeap(), 0, v->blob); v->blob = NULL; }
+    if (v->text) { free(v->text); v->text = NULL; }
+    if (v->blob) { free(v->blob); v->blob = NULL; }
     v->text_len = 0;
     v->blob_len = 0;
     v->type = VMS_VAL_NULL;
@@ -272,10 +287,10 @@ static void job_meta(void* arg)
         }
     }
     for (i = 1; i <= n; i++) {
-        SQLWCHAR name[128];
+        SQLWCHAR name[256];
         SQLSMALLINT name_len = 0, nullable = 0, digits = 0, sql_type = 0;
         SQLULEN col_size = 0;
-        char name_u8[128];
+        char name_u8[256];
         SQLRETURN dr = SQLDescribeColW(op->st->hstmt, (SQLUSMALLINT)i, name,
                                        (SQLSMALLINT)(sizeof(name) / sizeof(name[0])),
                                        &name_len, &sql_type, &col_size,
@@ -286,6 +301,9 @@ static void job_meta(void* arg)
             op->ok = 0;
             return;
         }
+        name[255] = 0; /* defensive terminator */
+        if (name_len < 0 || name_len > 255) name_len = 255;
+        name[name_len] = 0;
         WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)name, -1, name_u8, sizeof(name_u8), NULL, NULL);
         strncpy_s(op->st->meta[i - 1].name, sizeof(op->st->meta[i - 1].name),
                   name_u8, _TRUNCATE);
@@ -305,116 +323,192 @@ typedef struct OpFetch {
     int result; /* 1 row, 0 done, -1 error */
 } OpFetch;
 
-/* read one column in bounded chunks (R0: ordinals must increase monotonically,
- * which this loop guarantees: 1..n) */
-static int getdata_text(HSTMT h, int col, VmsValue* out, VmsError* err)
+/* read a short driver-convertible scalar (decimal/datetime/guid) as WCHAR
+ * text in one call — the driver renders these as bounded strings */
+static int getdata_scalar_text(HSTMT h, int col, VmsValue* out, VmsError* err)
 {
-    wchar_t chunk[VMS_GETDATA_CHUNK / sizeof(wchar_t)];
-    VmsBounded acc;
+    wchar_t buf[256];
     SQLLEN got = 0;
     SQLRETURN r;
-    size_t total_chars = 0;
+    size_t bytes8 = 0;
+    int n;
 
-    if (!vms_buf_init(&acc, 4096)) {
-        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
+    r = SQLGetData(h, (SQLUSMALLINT)col, SQL_C_WCHAR, buf, sizeof(buf), &got);
+    if (r == SQL_NO_DATA || (r == SQL_SUCCESS && got == 0)) {
+        out->type = VMS_VAL_TEXT;
+        out->text = (char*)malloc(1);
+        if (!out->text) return 0;
+        out->text[0] = 0;
+        out->text_len = 0;
+        return 1;
+    }
+    if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
+        int q;
+        diag_capture(err, SQL_HANDLE_STMT, h, "SQLGetData(scalar text)", &q);
         return 0;
     }
+    if (got == SQL_NULL_DATA) {
+        out->type = VMS_VAL_NULL;
+        return 1;
+    }
+    n = (got == SQL_NO_TOTAL || got < 0)
+        ? (int)(sizeof(buf) / sizeof(wchar_t)) - 1
+        : (int)(got / sizeof(wchar_t));
+    if (n < 0) n = 0;
+    if (vms_utf16_to_utf8(buf, (size_t)n, NULL, 0, &bytes8) != 0) {
+        vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0, "invalid utf16 scalar");
+        return 0;
+    }
+    out->text = (char*)malloc(bytes8 + 1);
+    if (!out->text) {
+        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM scalar text");
+        return 0;
+    }
+    vms_utf16_to_utf8(buf, (size_t)n, out->text, bytes8 + 1, &bytes8);
+    out->text[bytes8] = 0;
+    out->text_len = bytes8;
+    out->type = VMS_VAL_TEXT;
+    return 1;
+}
+
+/* read one text column in bounded chunks as raw UTF-16LE bytes, then convert
+ * the complete value once (strict validation over the whole string: chunk
+ * boundaries may split surrogate pairs, so per-chunk strict conversion is
+ * not possible). Ordinals still increase monotonically (1..n). */
+static int getdata_text(HSTMT h, int col, VmsValue* out, VmsError* err)
+{
+    unsigned char chunk[VMS_GETDATA_CHUNK];
+    unsigned char* acc = NULL;
+    size_t acc_len = 0, acc_cap = 0;
+    SQLLEN got = 0;
+    SQLRETURN r;
+    size_t wchars = 0;
+
     for (;;) {
-        r = SQLGetData(h, (SQLUSMALLINT)col, SQL_C_WCHAR, chunk, sizeof(chunk), &got);
+        r = SQLGetData(h, (SQLUSMALLINT)col, SQL_C_BINARY, chunk, sizeof(chunk), &got);
         if (r == SQL_NO_DATA) break;
         if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
             int q;
             diag_capture(err, SQL_HANDLE_STMT, h, "SQLGetData(text)", &q);
-            vms_buf_free(&acc);
+            free(acc);
             return 0;
         }
         if (got == SQL_NULL_DATA) {
             out->type = VMS_VAL_NULL;
-            vms_buf_free(&acc);
+            free(acc);
             return 1;
         }
-        {
-            size_t chars;
-            size_t bytes8 = 0;
-            if (got == SQL_NO_TOTAL) {
-                /* truncated chunk: buffer holds sizeof(chunk) minus terminator */
-                chars = sizeof(chunk) / sizeof(wchar_t) - 1;
-            } else if (got == 0) {
-                chars = 0;
-            } else {
-                chars = (size_t)got / sizeof(wchar_t);
-            }
-            if (chars > 0 && vms_utf16_to_utf8(chunk, chars, NULL, 0, &bytes8) != 0) {
-                vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
-                              "utf16 size check failed (chars=%zu)", chars);
-                vms_buf_free(&acc);
-                return 0;
-            }
-            if (chars > 0) {
-                char* tmp = (char*)HeapAlloc(GetProcessHeap(), 0, bytes8 + 1);
-                if (!tmp) {
-                    vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM chunk");
-                    vms_buf_free(&acc);
+        if (got > 0) {
+            size_t bytes = (size_t)got;
+            if (bytes > sizeof(chunk)) bytes = sizeof(chunk); /* got may exceed BufferLength */
+            if (acc_len + bytes + 1 > acc_cap) {
+                size_t ncap = acc_cap ? acc_cap * 2 : 65536;
+                unsigned char* na;
+                while (ncap < acc_len + bytes + 1) ncap *= 2;
+                na = (unsigned char*)realloc(acc, ncap);
+                if (!na) {
+                    vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
+                    free(acc);
                     return 0;
                 }
-                vms_utf16_to_utf8(chunk, chars, tmp, bytes8 + 1, &bytes8);
-                if (!vms_buf_append(&acc, tmp, bytes8)) {
-                    vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "row too large for buffer");
-                    HeapFree(GetProcessHeap(), 0, tmp);
-                    vms_buf_free(&acc);
-                    return 0;
-                }
-                HeapFree(GetProcessHeap(), 0, tmp);
-                total_chars += chars;
+                acc = na;
+                acc_cap = ncap;
             }
+            memcpy(acc + acc_len, chunk, bytes);
+            acc_len += bytes;
+            acc[acc_len] = 0;
+            wchars += bytes / sizeof(wchar_t);
         }
         if (r == SQL_SUCCESS) break; /* last chunk */
     }
-    out->type = VMS_VAL_TEXT;
-    out->text_len = vms_buf_len(&acc);
-    out->text = acc.data; /* transfer ownership */
-    (void)total_chars;
+    /* convert the assembled UTF-16LE value to UTF-8 in one strict pass */
+    {
+        size_t bytes8 = 0;
+        if (wchars == 0) {
+            out->type = VMS_VAL_TEXT;
+            out->text = (char*)malloc(1);
+            if (out->text) out->text[0] = 0;
+            out->text_len = 0;
+            free(acc);
+            return out->text ? 1 : 0;
+        }
+        if (acc_len % 2 != 0) {
+            vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0, "odd utf16 byte count");
+            free(acc);
+            return 0;
+        }
+        /* UTF-8 worst case: 3 bytes per UTF-16 code unit (no 4-byte output
+         * from a single UTF-16 unit; surrogates combine into <= 4 bytes but
+         * a pair consumes 2 units, so 3x is a safe upper bound). */
+        bytes8 = wchars * 3 + 1;
+        out->text = (char*)malloc(bytes8);
+        if (!out->text) {
+            vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM convert out");
+            free(acc);
+            return 0;
+        }
+        if (vms_utf16_to_utf8((const wchar_t*)acc, wchars, out->text, bytes8, &bytes8) != 0) {
+            vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0, "invalid utf16 in column");
+            free(out->text);
+            out->text = NULL;
+            free(acc);
+            return 0;
+        }
+        out->text[bytes8] = 0;
+        out->text_len = bytes8;
+        out->type = VMS_VAL_TEXT;
+    }
+    free(acc);
     return 1;
 }
 
 static int getdata_blob(HSTMT h, int col, VmsValue* out, VmsError* err)
 {
-    char chunk[VMS_GETDATA_CHUNK];
-    VmsBounded acc;
+    unsigned char chunk[VMS_GETDATA_CHUNK];
+    unsigned char* acc = NULL;
+    size_t acc_len = 0, acc_cap = 0;
     SQLLEN got = 0;
     SQLRETURN r;
 
-    if (!vms_buf_init(&acc, 4096)) {
-        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
-        return 0;
-    }
     for (;;) {
         r = SQLGetData(h, (SQLUSMALLINT)col, SQL_C_BINARY, chunk, sizeof(chunk), &got);
         if (r == SQL_NO_DATA) break;
         if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
             int q;
             diag_capture(err, SQL_HANDLE_STMT, h, "SQLGetData(blob)", &q);
-            vms_buf_free(&acc);
+            free(acc);
             return 0;
         }
         if (got == SQL_NULL_DATA) {
             out->type = VMS_VAL_NULL;
-            vms_buf_free(&acc);
+            free(acc);
             return 1;
         }
-        {
-            size_t bytes = (got == SQL_NO_TOTAL) ? sizeof(chunk) : (size_t)got;
-            if (!vms_buf_append(&acc, chunk, bytes)) {
-                vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "row too large for buffer");
-                vms_buf_free(&acc);
-                return 0;
+        if (got > 0) {
+            size_t bytes = (size_t)got;
+            if (bytes > sizeof(chunk)) bytes = sizeof(chunk); /* got may exceed BufferLength */
+            if (acc_len + bytes + 1 > acc_cap) {
+                size_t ncap = acc_cap ? acc_cap * 2 : 65536;
+                unsigned char* na;
+                while (ncap < acc_len + bytes + 1) ncap *= 2;
+                na = (unsigned char*)realloc(acc, ncap);
+                if (!na) {
+                    vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
+                    free(acc);
+                    return 0;
+                }
+                acc = na;
+                acc_cap = ncap;
             }
+            memcpy(acc + acc_len, chunk, bytes);
+            acc_len += bytes;
+            acc[acc_len] = 0;
         }
         if (r == SQL_SUCCESS) break;
     }
     out->type = VMS_VAL_BLOB;
-    out->blob_len = vms_buf_len(&acc);
-    out->blob = (unsigned char*)acc.data;
+    out->blob_len = acc_len;
+    out->blob = acc;
     return 1;
 }
 
@@ -440,8 +534,7 @@ static void job_fetch(void* arg)
     }
     /* decode COMPLETE row before making it visible (TZ invariant) */
     if (!st->row && st->col_count > 0) {
-        st->row = (VmsValue*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                       sizeof(VmsValue) * (size_t)st->col_count);
+        st->row = (VmsValue*)calloc(1, sizeof(VmsValue) * (size_t)st->col_count);
         if (!st->row) {
             vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row");
             op->result = -1;
@@ -480,9 +573,11 @@ static void job_fetch(void* arg)
             else { v->type = VMS_VAL_FLOAT64; v->f = dv; }
             break;
         }
-        case VMS_CT_TEXT: case VMS_CT_DECIMAL: case VMS_CT_DATETIME:
-        case VMS_CT_GUID: case VMS_CT_BIGTEXT:
+        case VMS_CT_TEXT: case VMS_CT_BIGTEXT:
             if (!getdata_text(st->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
+        case VMS_CT_DECIMAL: case VMS_CT_DATETIME: case VMS_CT_GUID:
+            if (!getdata_scalar_text(st->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
         case VMS_CT_BLOB:
             if (!getdata_blob(st->hstmt, i, v, op->err)) { op->result = -1; return; }
@@ -642,6 +737,12 @@ VmsConnection* vms_conn_open(VmsClient* c, const wchar_t* connstr_w, VmsError* e
         HeapFree(GetProcessHeap(), 0, cn);
         return NULL;
     }
+    /* remember the connstr for cursor leases (R6) */
+    {
+        size_t n = wcslen(connstr_w) + 1;
+        cn->last_connstr = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(wchar_t));
+        if (cn->last_connstr) memcpy(cn->last_connstr, connstr_w, n * sizeof(wchar_t));
+    }
     /* manual-transaction mode is opt-in via vms_tran_begin(); default
      * connection stays in autocommit (SQLite drives transaction timing) */
     return cn;
@@ -654,6 +755,10 @@ void vms_conn_close(VmsConnection* cn)
     if (cn->hdbc) {
         SQLDisconnect(cn->hdbc);
         SQLFreeHandle(SQL_HANDLE_DBC, cn->hdbc);
+    }
+    if (cn->last_connstr) {
+        HeapFree(GetProcessHeap(), 0, cn->last_connstr);
+        cn->last_connstr = NULL;
     }
     HeapFree(GetProcessHeap(), 0, cn);
 }
@@ -868,3 +973,400 @@ int vms_tran_rollback(VmsConnection* cn, VmsError* err)
     vms_worker_run(cn->worker, job_rollback, &op);
     return op.ok ? 0 : -1;
 }
+
+/* ================= R6 read cursor (independent lease) ================= */
+
+/* cursor jobs operate on the lease's own worker; the fetch job mirrors
+ * job_fetch but owns its HDBC/HSTMT directly */
+
+typedef struct OpCursorOpen {
+    VmsCursor* cur;
+    const wchar_t* sql;
+    VmsError* err;
+    int ok;
+} OpCursorOpen;
+
+static void job_cursor_open(void* arg)
+{
+    OpCursorOpen* op = (OpCursorOpen*)arg;
+    SQLRETURN r;
+    vms_error_ok(op->err);
+    vms_worker_set_active(op->cur->worker, op->cur->hstmt);
+    r = SQLExecDirectW(op->cur->hstmt, (SQLWCHAR*)op->sql, SQL_NTS);
+    vms_worker_set_active(op->cur->worker, NULL);
+    if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO || r == SQL_NO_DATA)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_STMT, op->cur->hstmt, "cursor open", &q);
+        op->ok = 0;
+        return;
+    }
+    op->ok = 1;
+}
+
+/* cursor meta: shared shape with OpMeta but on the cursor handle */
+typedef struct OpCursorMeta {
+    VmsCursor* cur;
+    VmsError* err;
+    int ok;
+} OpCursorMeta;
+
+static void job_cursor_meta(void* arg)
+{
+    OpCursorMeta* op = (OpCursorMeta*)arg;
+    VmsCursor* cur = op->cur;
+    SQLSMALLINT n = 0;
+    int i;
+    vms_error_ok(op->err);
+    if (!SQL_SUCCEEDED(SQLNumResultCols(cur->hstmt, &n))) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_STMT, cur->hstmt, "cursor SQLNumResultCols", &q);
+        op->ok = 0;
+        return;
+    }
+    cur->col_count = n;
+    if (n > 0) {
+        cur->meta = (VmsColumnMeta*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                              sizeof(VmsColumnMeta) * (size_t)n);
+        if (!cur->meta) {
+            vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor meta");
+            op->ok = 0;
+            return;
+        }
+    }
+    for (i = 1; i <= n; i++) {
+        SQLWCHAR name[256];
+        SQLSMALLINT name_len = 0, nullable = 0, digits = 0, sql_type = 0;
+        SQLULEN col_size = 0;
+        char name_u8[256];
+        if (!SQL_SUCCEEDED(SQLDescribeColW(cur->hstmt, (SQLUSMALLINT)i, name,
+                                           (SQLSMALLINT)(sizeof(name) / sizeof(name[0])),
+                                           &name_len, &sql_type, &col_size,
+                                           &digits, &nullable))) {
+            int q;
+            diag_capture(op->err, SQL_HANDLE_STMT, cur->hstmt, "cursor SQLDescribeColW", &q);
+            op->ok = 0;
+            return;
+        }
+        name[255] = 0;
+        if (name_len < 0 || name_len > 255) name_len = 255;
+        name[name_len] = 0;
+        WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)name, -1, name_u8, sizeof(name_u8), NULL, NULL);
+        strncpy_s(cur->meta[i - 1].name, sizeof(cur->meta[i - 1].name), name_u8, _TRUNCATE);
+        cur->meta[i - 1].type = map_col_type(sql_type, col_size);
+        cur->meta[i - 1].nullable = (nullable != SQL_NO_NULLS);
+        cur->meta[i - 1].col_size = (unsigned long)col_size;
+        cur->meta[i - 1].decimal_digits = (unsigned short)digits;
+    }
+    op->ok = 1;
+}
+
+typedef struct OpCursorFetch {
+    VmsCursor* cur;
+    VmsError* err;
+    int result;
+} OpCursorFetch;
+
+static void job_cursor_fetch(void* arg)
+{
+    OpCursorFetch* op = (OpCursorFetch*)arg;
+    VmsCursor* cur = op->cur;
+    SQLRETURN r;
+    int i;
+
+    vms_error_ok(op->err);
+    if (InterlockedCompareExchange(&cur->closed, 0, 0)) {
+        vms_error_set(op->err, VMS_ERR_QUARANTINED, NULL, 0, "cursor closed");
+        op->result = -1;
+        return;
+    }
+    /* release previous row before fetching the next */
+    if (cur->row) {
+        int j;
+        for (j = 0; j < cur->col_count; j++) value_clear(&cur->row[j]);
+        cur->row_ready = 0;
+    }
+    vms_worker_set_active(cur->worker, cur->hstmt);
+    r = SQLFetch(cur->hstmt);
+    vms_worker_set_active(cur->worker, NULL);
+    if (r == SQL_NO_DATA) { op->result = 0; return; }
+    if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_STMT, cur->hstmt, "cursor SQLFetch", &q);
+        op->result = -1;
+        return;
+    }
+    if (!cur->row && cur->col_count > 0) {
+        cur->row = (VmsValue*)calloc(1, sizeof(VmsValue) * (size_t)cur->col_count);
+        if (!cur->row) {
+            vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor row");
+            op->result = -1;
+            return;
+        }
+    }
+    /* complete-row decode before visibility (TZ invariant) */
+    for (i = 1; i <= cur->col_count; i++) {
+        VmsValue* v = &cur->row[i - 1];
+        const VmsColumnMeta* m = &cur->meta[i - 1];
+        switch (m->type) {
+        case VMS_CT_INT64: {
+            SQLBIGINT iv = 0;
+            SQLLEN ind = 0;
+            if (!SQL_SUCCEEDED(SQLGetData(cur->hstmt, (SQLUSMALLINT)i, SQL_C_SBIGINT,
+                                          &iv, 0, &ind))) {
+                int q;
+                diag_capture(op->err, SQL_HANDLE_STMT, cur->hstmt, "cursor SQLGetData(int)", &q);
+                op->result = -1;
+                return;
+            }
+            if (ind == SQL_NULL_DATA) v->type = VMS_VAL_NULL;
+            else { v->type = VMS_VAL_INT64; v->i = (long long)iv; }
+            break;
+        }
+        case VMS_CT_FLOAT64: {
+            double dv = 0;
+            SQLLEN ind = 0;
+            if (!SQL_SUCCEEDED(SQLGetData(cur->hstmt, (SQLUSMALLINT)i, SQL_C_DOUBLE,
+                                          &dv, 0, &ind))) {
+                int q;
+                diag_capture(op->err, SQL_HANDLE_STMT, cur->hstmt, "cursor SQLGetData(float)", &q);
+                op->result = -1;
+                return;
+            }
+            if (ind == SQL_NULL_DATA) v->type = VMS_VAL_NULL;
+            else { v->type = VMS_VAL_FLOAT64; v->f = dv; }
+            break;
+        }
+        case VMS_CT_TEXT: case VMS_CT_BIGTEXT:
+            if (!getdata_text(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
+        case VMS_CT_DECIMAL: case VMS_CT_DATETIME: case VMS_CT_GUID:
+            /* driver-convertible scalars: fetch as driver text (WCHAR) */
+            if (!getdata_scalar_text(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
+        case VMS_CT_BLOB:
+            if (!getdata_blob(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
+        }
+    }
+    cur->row_ready = 1;
+    op->result = 1;
+}
+
+VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
+                           const char* table, const VmsMetaColumn* cols,
+                           int ncols, VmsError* err)
+{
+    VmsCursor* cur;
+    wchar_t sql[2048];
+    OpCursorOpen open_op;
+    OpCursorMeta meta_op;
+    int i;
+
+    vms_error_ok(err);
+    if (!cn || !schema || !table || !cols || ncols <= 0) {
+        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "cursor open: bad args");
+        return NULL;
+    }
+    if (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128)) {
+        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "invalid identifier");
+        return NULL;
+    }
+
+    cur = (VmsCursor*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmsCursor));
+    if (!cur) {
+        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor");
+        return NULL;
+    }
+    /* independent lease: own HDBC from the connection's client environment */
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, cn->client->env, &cur->hdbc))) {
+        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor lease hdbc");
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
+    }
+    cur->worker = vms_worker_start();
+    if (!cur->worker) {
+        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor worker");
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
+    }
+    {
+        /* connect the lease using the same deterministic posture; the caller
+         * passes its profile-driven connstr through the parent connection —
+         * but for R6 the lease re-uses the parent's connstr stored at open
+         * time. Simpler: the parent connection remembers its connstr. */
+    }
+
+    /* build projection: bracketed identifiers guard the SELECT shape */
+    {
+        wchar_t proj[1024];
+        size_t used = 0;
+        proj[0] = 0;
+        for (i = 0; i < ncols; i++) {
+            wchar_t colw[256];
+            int n;
+            if (!vms_meta_ident_valid(cols[i].name, 128)) {
+                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0,
+                              "invalid column name '%s'", cols[i].name);
+                vms_worker_stop(cur->worker);
+                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+                HeapFree(GetProcessHeap(), 0, cur);
+                return NULL;
+            }
+            /* bracket-quote the identifier: [name] (names are pre-validated
+             * to contain no ']' characters) */
+            n = MultiByteToWideChar(CP_UTF8, 0, cols[i].name, -1, colw + 1, 254);
+            if (n <= 0 || used + (size_t)n + 4 >= 1024) {
+                vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "projection too wide");
+                vms_worker_stop(cur->worker);
+                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+                HeapFree(GetProcessHeap(), 0, cur);
+                return NULL;
+            }
+            colw[0] = L'[';
+            colw[n] = L']';
+            colw[n + 1] = 0;
+            if (i) { proj[used++] = L','; proj[used] = 0; }
+            wcscat_s(proj + used, 1024 - used, colw);
+            used += (size_t)n + 1;
+        }
+        _snwprintf_s(sql, 2048, _TRUNCATE,
+                     L"SELECT %ls FROM [%hs].[%hs]", proj, schema, table);
+    }
+
+    /* connect + open on the lease worker */
+    {
+        struct OpLease {
+            VmsCursor* cur;
+            const wchar_t* connstr;
+            VmsError* err;
+            int ok;
+        } lo;
+        lo.cur = cur;
+        lo.connstr = NULL; /* unused in R6 single-server scope */
+        lo.err = err;
+        lo.ok = 0;
+        /* The lease connection must use the same server/auth as the parent.
+         * R6 scope: the parent connection stores its connstr for reuse. */
+        if (!cn->last_connstr) {
+            vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
+                          "parent connection has no stored connstr for leases");
+            vms_worker_stop(cur->worker);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            HeapFree(GetProcessHeap(), 0, cur);
+            return NULL;
+        }
+        {
+            SQLRETURN r = SQLDriverConnectW(cur->hdbc, NULL,
+                                            (SQLWCHAR*)cn->last_connstr, SQL_NTS,
+                                            NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+            if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
+                int q;
+                diag_capture(err, SQL_HANDLE_DBC, cur->hdbc, "cursor lease connect", &q);
+                vms_worker_stop(cur->worker);
+                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+                HeapFree(GetProcessHeap(), 0, cur);
+                return NULL;
+            }
+        }
+    }
+
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, cur->hdbc, &cur->hstmt))) {
+        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor stmt");
+        SQLDisconnect(cur->hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        vms_worker_stop(cur->worker);
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
+    }
+
+    open_op.cur = cur;
+    open_op.sql = sql;
+    open_op.err = err;
+    open_op.ok = 0;
+    vms_worker_run(cur->worker, job_cursor_open, &open_op);
+    if (!open_op.ok) {
+        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+        SQLDisconnect(cur->hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        vms_worker_stop(cur->worker);
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
+    }
+
+    meta_op.cur = cur;
+    meta_op.err = err;
+    meta_op.ok = 0;
+    vms_worker_run(cur->worker, job_cursor_meta, &meta_op);
+    if (!meta_op.ok) {
+        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+        SQLDisconnect(cur->hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        vms_worker_stop(cur->worker);
+        HeapFree(GetProcessHeap(), 0, cur);
+        return NULL;
+    }
+    return cur;
+}
+
+void vms_cursor_close(VmsCursor* cur)
+{
+    if (!cur) return;
+    InterlockedExchange(&cur->closed, 1);
+    if (cur->hstmt) {
+        SQLFreeStmt(cur->hstmt, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+        cur->hstmt = NULL;
+    }
+    if (cur->row) {
+        int j;
+        for (j = 0; j < cur->col_count; j++) value_clear(&cur->row[j]);
+        free(cur->row);
+        cur->row = NULL;
+    }
+    if (cur->meta) HeapFree(GetProcessHeap(), 0, cur->meta);
+    if (cur->hdbc) {
+        SQLDisconnect(cur->hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+    }
+    if (cur->worker) vms_worker_stop(cur->worker);
+    HeapFree(GetProcessHeap(), 0, cur);
+}
+
+int vms_cursor_fetch(VmsCursor* cur, VmsError* err)
+{
+    OpCursorFetch op;
+    if (!cur) return -1;
+    op.cur = cur;
+    op.err = err;
+    op.result = -1;
+    vms_worker_run(cur->worker, job_cursor_fetch, &op);
+    return op.result;
+}
+
+int vms_cursor_cancel(VmsCursor* cur)
+{
+    if (!cur) return 0;
+    vms_worker_cancel_active(cur->worker);
+    return 1;
+}
+
+int vms_cursor_col_count(const VmsCursor* cur)
+{
+    return cur ? cur->col_count : 0;
+}
+
+const VmsColumnMeta* vms_cursor_meta(const VmsCursor* cur, int col)
+{
+    if (!cur || col < 0 || col >= cur->col_count) return NULL;
+    return &cur->meta[col];
+}
+
+const VmsValue* vms_cursor_value(const VmsCursor* cur, int col)
+{
+    if (!cur || !cur->row_ready || col < 0 || col >= cur->col_count) return NULL;
+    return &cur->row[col];
+}
+
+
+

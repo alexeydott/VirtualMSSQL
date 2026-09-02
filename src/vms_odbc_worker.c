@@ -95,18 +95,20 @@ static void worker_push(VmsWorker* w, struct VmsJob* j)
 
 void vms_worker_run(VmsWorker* w, VmsJobFn fn, void* arg)
 {
-    struct VmsJob j;
-    j.fn = fn;
-    j.arg = arg;
-    j.next = NULL;
-    j.done = 0;
-    worker_push(w, &j);
-    /* wait for completion (stack job: must not return early) */
+    struct VmsJob* j;
+    j = (struct VmsJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(struct VmsJob));
+    if (!j) return;
+    j->fn = fn;
+    j->arg = arg;
+    j->next = NULL;
+    j->done = 0;
+    worker_push(w, j);
     EnterCriticalSection(&w->cs);
-    while (!j.done) {
+    while (!j->done) {
         SleepConditionVariableCS(&w->cv_done, &w->cs, INFINITE);
     }
     LeaveCriticalSection(&w->cs);
+    HeapFree(GetProcessHeap(), 0, j);
 }
 
 struct VmsJob* vms_worker_post(VmsWorker* w, VmsJobFn fn, void* arg)

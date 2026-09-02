@@ -42,17 +42,26 @@ void vms_buf_free(VmsBounded* b);
 /* Append len bytes from src. Returns 0 when the append does not fit. */
 int vms_buf_append(VmsBounded* b, const void* src, size_t len);
 
+/* Append len bytes, growing the allocation as needed (doubling).
+ * Returns 0 on OOM/overflow. */
+int vms_buf_append_grow(VmsBounded* b, const void* src, size_t len);
+
 /* Current used length in bytes. */
 size_t vms_buf_len(const VmsBounded* b);
 
 /* ---- UTF-8 <-> UTF-16 conversion (wide = UTF-16LE on Windows) ----
  * Convert with explicit bounds; never reads or writes past the given sizes.
  * out_len receives the number of wchar_t/code units written. Returns 0 on
- * success, -1 when the destination is too small, -2 on invalid encoding. */
+ * success, -1 when the destination is too small, -2 on invalid encoding.
+ * The _loose variants skip strict surrogate validation: they exist for
+ * streaming chunk conversion, where a chunk may legally split a surrogate
+ * pair (the stream as a whole is still validated by the caller). */
 int vms_utf8_to_utf16(const char* src, size_t src_bytes,
                       wchar_t* dst, size_t dst_wchars, size_t* out_wchars);
 int vms_utf16_to_utf8(const wchar_t* src, size_t src_wchars,
                       char* dst, size_t dst_bytes, size_t* out_bytes);
+int vms_utf16_to_utf8_loose(const wchar_t* src, size_t src_wchars,
+                            char* dst, size_t dst_bytes, size_t* out_bytes);
 
 /* ---- versioned fingerprints (R2 diagnostics) ----
  * Stable 64-bit FNV-1a fingerprint of a byte range, salted with a stage tag

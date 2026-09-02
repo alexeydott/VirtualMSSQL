@@ -25,9 +25,11 @@ add_library(vms_client STATIC
     src/vms_connstr.c
     src/vms_pool.c
     src/vms_meta.c
+    src/vms_vtab.c
 )
 target_include_directories(vms_client PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite
 )
 target_compile_definitions(vms_client PRIVATE
     _CRT_SECURE_NO_WARNINGS

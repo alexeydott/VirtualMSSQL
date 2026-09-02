@@ -11,6 +11,9 @@ else()
 endif()
 set(VMS_SQLITE_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/bin/${VMS_ARCH}")
 
+# place the host sqlite3.dll next to every test executable that links it
+file(COPY "${VMS_SQLITE_BIN_DIR}/sqlite3.dll" DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+
 # ---- harness implementation (static; linked into tests that need sqlite3) ----
 add_library(vms_test_harness STATIC test_harness_impl.c)
 target_include_directories(vms_test_harness PUBLIC
@@ -95,3 +98,20 @@ add_executable(test_r5 test_r5.c)
 target_link_libraries(test_r5 PRIVATE vms_client)
 target_compile_options(test_r5 PRIVATE /utf-8)
 add_test(NAME r5 COMMAND test_r5)
+
+# ---- suite 9: vtab read path (G6; needs live server) ----
+add_executable(test_r6 test_r6.c)
+target_include_directories(test_r6 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_link_libraries(test_r6 PRIVATE vms_test_harness vms_client dbghelp)
+target_compile_options(test_r6 PRIVATE /utf-8)
+add_dependencies(test_r6 virtualmssql)
+add_test(NAME r6
+    COMMAND test_r6 $<TARGET_FILE:virtualmssql>)
+
+# seed helper (not a test): creates R6 fixtures on the live server
+add_executable(seed_r6 seed_r6.c)
+target_link_libraries(seed_r6 PRIVATE vms_client)
+target_compile_options(seed_r6 PRIVATE /utf-8)

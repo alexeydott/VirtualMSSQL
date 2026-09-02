@@ -3,8 +3,13 @@
  * table module and the virtualmssql_version() scalar. */
 #include "vms_api.h"
 #include "vms_internal.h"
+#include "vms_vtab.h"
+#include "vms_connstr.h"
+#include "vms_credentials.h"
+#include <windows.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* redirect sqlite3_* calls through the api-routines thunk */
 #ifndef SQLITE_CORE
@@ -135,6 +140,94 @@ static void version_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
 static const char* kStubSchema =
     "CREATE TABLE IF NOT EXISTS virtualmssql_stub(msg TEXT)";
 
+/* profile string for the vtab environment: set via the virtualmssql_profile
+ * scalar before CREATE VIRTUAL TABLE, or falls back to the VMS_TEST_PROFILE
+ * env (tests). Stored process-wide for R6 single-env scope. */
+static char g_profile_spec[1024];
+static sqlite3* g_profile_db = NULL;
+
+static void profile_set_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
+{
+    (void)argc;
+    if (sqlite3_value_type(argv[0]) != SQLITE_TEXT) {
+        sqlite3_result_error(ctx, "virtualmssql_profile expects a text profile", -1);
+        return;
+    }
+    strncpy_s(g_profile_spec, sizeof(g_profile_spec),
+              (const char*)sqlite3_value_text(argv[0]), _TRUNCATE);
+    /* lazy module registration: the profile must exist before the env can */
+    if (g_profile_db) {
+        char* vtab_err = NULL;
+        if (vms_vtab_env_init(g_profile_db, &vtab_err) != SQLITE_OK) {
+            sqlite3_result_error(ctx,
+                vtab_err ? vtab_err : "virtualmssql: env init failed", -1);
+            if (vtab_err) sqlite3_free(vtab_err);
+            return;
+        }
+        g_profile_db = NULL;
+    }
+    sqlite3_result_null(ctx);
+}
+
+/* scalar: virtualmssql_cred('key', 'secret') — registers a secret with the
+ * active provider. Exists so hosts/tests can provision credentials through
+ * the DLL itself (the provider state lives inside the DLL). */
+static void cred_set_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
+{
+    wchar_t key[256];
+    wchar_t secret[512];
+    if (argc != 2 || sqlite3_value_type(argv[0]) != SQLITE_TEXT ||
+        sqlite3_value_type(argv[1]) != SQLITE_TEXT) {
+        sqlite3_result_error(ctx, "virtualmssql_cred(key, secret) expects two texts", -1);
+        return;
+    }
+    {
+        const unsigned char* k = sqlite3_value_text(argv[0]);
+        const unsigned char* s = sqlite3_value_text(argv[1]);
+        int nk = MultiByteToWideChar(CP_UTF8, 0, (const char*)k, -1, key, 256);
+        int ns = MultiByteToWideChar(CP_UTF8, 0, (const char*)s, -1, secret, 512);
+        if (nk <= 0 || ns <= 0) {
+            sqlite3_result_error(ctx, "virtualmssql_cred: conversion failed", -1);
+            return;
+        }
+    }
+    /* provider must already be installed (load time default = memory) */
+    if (!vms_cred_memory_set(key, secret)) {
+        sqlite3_result_error(ctx, "virtualmssql_cred: registration failed", -1);
+        return;
+    }
+    sqlite3_result_null(ctx);
+}
+
+static int vms_vtab_env_init(sqlite3* db, char** pzErrMsg)
+{
+    VmsProfile profile;
+    VmsError err;
+    const char* spec = g_profile_spec[0] ? g_profile_spec : getenv("VMS_TEST_PROFILE");
+    VmsVtabEnv* env;
+
+    if (!spec || !spec[0]) {
+        *pzErrMsg = sqlite3_mprintf(
+            "virtualmssql: no connection profile; call "
+            "virtualmssql_profile('server=...;auth=...;cred=...') first");
+        return SQLITE_ERROR;
+    }
+    if (!vms_profile_parse(spec, &profile, &err)) {
+        *pzErrMsg = sqlite3_mprintf("virtualmssql: bad profile: %s", err.message);
+        return SQLITE_ERROR;
+    }
+    env = vms_vtab_env_create(&profile, &err);
+    if (!env) {
+        *pzErrMsg = sqlite3_mprintf("virtualmssql: env init failed: %s", err.message);
+        return SQLITE_ERROR;
+    }
+    if (vms_vtab_register(db, env, pzErrMsg) != SQLITE_OK) {
+        vms_vtab_env_destroy(env);
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
 int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
                                    const sqlite3_api_routines* pApi)
 {
@@ -145,13 +238,16 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
     SQLITE_EXTENSION_INIT2(pApi);
     (void)pzErrMsg;
 
+    /* default credential provider lives inside the DLL (R6: hosts provision
+     * secrets through virtualmssql_cred() which writes to this instance) */
+    vms_cred_set_provider(vms_cred_memory_provider());
+
     sqlite_version = sqlite3_libversion_number();
 
     /* R1.3: no silent downgrade — refuse old hosts explicitly. */
     cap = vms_check_host_capabilities(sqlite_version);
     if (cap != VMS_CAP_OK) {
         const char* diag = vms_capability_diagnostic(cap, sqlite_version);
-        fprintf(stderr, "%s\n", diag);
         return SQLITE_ERROR;
     }
 
@@ -165,6 +261,30 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
                                 SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
                                 version_func, NULL, NULL) != SQLITE_OK) {
         return SQLITE_ERROR;
+    }
+    if (sqlite3_create_function(db, "virtualmssql_profile", 1,
+                                SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                                profile_set_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    if (sqlite3_create_function(db, "virtualmssql_cred", 2,
+                                SQLITE_UTF8, NULL,
+                                cred_set_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    /* R6: register the real module eagerly when a profile is already
+     * available (env var); otherwise it registers lazily inside the
+     * virtualmssql_profile() scalar. */
+    if (g_profile_spec[0] || getenv("VMS_TEST_PROFILE")) {
+        char* vtab_err = NULL;
+        if (vms_vtab_env_init(db, &vtab_err) != SQLITE_OK) {
+            /* non-fatal: diagnostic printed; profile scalar can retry */
+                    vtab_err ? vtab_err : "?");
+            g_profile_db = db;
+            if (vtab_err) sqlite3_free(vtab_err);
+        }
+    } else {
+        g_profile_db = db;
     }
     return SQLITE_OK;
 }
