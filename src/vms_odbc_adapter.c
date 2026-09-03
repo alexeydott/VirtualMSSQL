@@ -586,9 +586,21 @@ static void job_fetch(void* arg)
         case VMS_CT_DECIMAL: case VMS_CT_DATETIME: case VMS_CT_GUID:
             if (!getdata_scalar_text(st->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
+        case VMS_CT_SPATIAL:
+            /* R12: spatial UDTs stream as WKB through SQLGetData binary
+             * (the native CLR serialization is not exposed to ODBC) */
+            if (!getdata_blob(st->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
         case VMS_CT_BLOB:
             if (!getdata_blob(st->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
+        case VMS_CT_UNSUPPORTED:
+            /* deterministic policy: the column never yields a value */
+            vms_error_set(op->err, VMS_ERR_UNSUPPORTED_TYPE, "IM001", 0,
+                          "UNSUPPORTED_TYPE: column '%s' has a type with no "
+                          "lossless mapping", m->name);
+            op->result = -1;
+            return;
         }
     }
     st->row_ready = 1;
@@ -1633,9 +1645,20 @@ static void job_cursor_fetch(void* arg)
             /* driver-convertible scalars: fetch as driver text (WCHAR) */
             if (!getdata_scalar_text(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
+        case VMS_CT_SPATIAL:
+            /* R12: spatial UDTs stream as WKB through SQLGetData binary */
+            if (!getdata_blob(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
+            break;
         case VMS_CT_BLOB:
             if (!getdata_blob(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
+        case VMS_CT_UNSUPPORTED:
+            /* deterministic policy: the column never yields a value */
+            vms_error_set(op->err, VMS_ERR_UNSUPPORTED_TYPE, "IM001", 0,
+                          "UNSUPPORTED_TYPE: column '%s' has a type with no "
+                          "lossless mapping", cur->meta[i - 1].name);
+            op->result = -1;
+            return;
         }
     }
     cur->row_ready = 1;
@@ -1900,10 +1923,21 @@ VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
         for (i = 0; i < ncols; i++) {
             wchar_t colw[256];
             int n;
+            int ansi_text = (cols[i].vtype == VMS_CT_TEXT ||
+                             cols[i].vtype == VMS_CT_BIGTEXT) &&
+                            (!_stricmp(cols[i].type_name, "char") ||
+                             !_stricmp(cols[i].type_name, "varchar") ||
+                             !_stricmp(cols[i].type_name, "text") ||
+                             !_stricmp(cols[i].type_name, "xml"));
             if (!vms_meta_ident_valid(cols[i].name, 128)) {
                 vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0,
                               "invalid column name '%s'", cols[i].name);
                 return NULL;
+            }
+            if (ansi_text) {
+                if (used + 6 >= 2048) return NULL;
+                wcscat_s(sql + used, 2048 - used, L"CAST(");
+                used += 5;
             }
             n = MultiByteToWideChar(CP_UTF8, 0, cols[i].name, -1, colw + 1, 254);
             if (n <= 0 || used + (size_t)n + 4 >= 2048) {
@@ -1916,6 +1950,29 @@ VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
             if (i) { sql[used++] = L','; sql[used] = 0; }
             wcscat_s(sql + used, 2048 - used, colw);
             used += (size_t)n + 1;
+            if (ansi_text) {
+                /* R12: ANSI text types stream as ANSI bytes through
+                 * SQLGetData(SQL_C_BINARY); the nvarchar cast makes the
+                 * value arrive as UTF-16 regardless of collation */
+                wchar_t cast[32];
+                int cn2 = MultiByteToWideChar(CP_UTF8, 0,
+                        cols[i].vtype == VMS_CT_BIGTEXT ? " AS nvarchar(max))" : " AS nvarchar(4000))",
+                        -1, cast, 32);
+                if (cn2 <= 0 || used + (size_t)cn2 >= 2048) return NULL;
+                wcscat_s(sql + used, 2048 - used, cast);
+                used += (size_t)cn2 - 1;
+            }
+            if (cols[i].vtype == VMS_CT_SPATIAL) {
+                /* R12: spatial columns project through STAsBinary() (the
+                 * default WKB representation) */
+                wchar_t meth[32];
+                int m = MultiByteToWideChar(CP_UTF8, 0, ".STAsBinary()", -1,
+                                            meth, 32);
+                if (m > 0 && used + (size_t)m < 2048) {
+                    wcscat_s(sql + used, 2048 - used, meth);
+                    used += (size_t)m - 1;
+                }
+            }
         }
         _snwprintf_s(head, 64, _TRUNCATE, L"");
         (void)head;

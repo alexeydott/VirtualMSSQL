@@ -92,6 +92,7 @@ static VmsColType vtype_from_sql_type(const char* t, unsigned long max_length)
         !strcmp(t, "datetime2") || !strcmp(t, "smalldatetime") ||
         !strcmp(t, "datetimeoffset")) return VMS_CT_DATETIME;
     if (!strcmp(t, "uniqueidentifier")) return VMS_CT_GUID;
+    if (!strcmp(t, "geometry") || !strcmp(t, "geography")) return VMS_CT_SPATIAL;
     if (!strcmp(t, "binary") || !strcmp(t, "varbinary") ||
         !strcmp(t, "image") || !strcmp(t, "rowversion") ||
         !strcmp(t, "timestamp")) return VMS_CT_BLOB;
@@ -101,7 +102,10 @@ static VmsColType vtype_from_sql_type(const char* t, unsigned long max_length)
         if (max_length == (unsigned long)-1 || max_length == 0) return VMS_CT_BIGTEXT;
         return VMS_CT_TEXT;
     }
-    return VMS_CT_TEXT;
+    /* R12: deterministic UNSUPPORTED_TYPE policy — types without a lossless
+     * mapping (sql_variant, hierarchyid, ...) fail the table instead of
+     * silently degrading to TEXT */
+    return VMS_CT_UNSUPPORTED;
 }
 
 /* ---- object kind ---- */

@@ -59,6 +59,8 @@ static int desc_row(void* user, VmsStatement* st)
              !strcmp(type_name, "datetime") || !strcmp(type_name, "datetime2") ||
              !strcmp(type_name, "smalldatetime") || !strcmp(type_name, "datetimeoffset")) m->vtype = VMS_CT_DATETIME;
     else if (!strcmp(type_name, "uniqueidentifier")) m->vtype = VMS_CT_GUID;
+    else if (!strcmp(type_name, "geometry") || !strcmp(type_name, "geography"))
+        m->vtype = VMS_CT_SPATIAL;
     else if (!strcmp(type_name, "binary") || !strcmp(type_name, "varbinary") ||
              !strcmp(type_name, "image") || !strcmp(type_name, "rowversion")) m->vtype = VMS_CT_BLOB;
     else if (!strcmp(type_name, "xml")) m->vtype = VMS_CT_BIGTEXT;
@@ -68,7 +70,7 @@ static int desc_row(void* user, VmsStatement* st)
         m->vtype = (m->max_length == (unsigned long)-1 || m->max_length == 0)
                        ? VMS_CT_BIGTEXT : VMS_CT_TEXT;
     }
-    else m->vtype = VMS_CT_TEXT;
+    else m->vtype = VMS_CT_UNSUPPORTED;
 
     /* unique column names contract */
     for (j = 0; j < src->ncols; j++) {

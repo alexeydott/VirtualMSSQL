@@ -57,6 +57,8 @@ struct VmsVtab {
     VmsDmlContext* dml;    /* prepared lazily; requires a stable key */
     /* R11: DML context bound to the pinned transaction connection */
     VmsDmlContext* dml_txn;
+    /* R12: spatial columns rendered as WKT (1) or WKB (0, default) */
+    int spatial_wkt;
     /* R10: stable-key values of the last row positioned by xRowid (stash
      * for xUpdate WHERE clauses: DELETE has no cursor access in xUpdate,
      * but SQLite always calls xRowid right before DELETE/UPDATE) */
@@ -118,6 +120,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     int is_query = 0;
     int rw = 0;
     int mat_mode_parsed = VMS_MAT_OFF;
+    int spatial_wkt = 0; /* R12: default spatial representation = WKB */
 
     (void)argc;
     if (!g_env) {
@@ -164,6 +167,16 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
             mat_mode_parsed = vms_mat_mode_parse(mvbuf);
             if (mat_mode_parsed < 0) {
                 *pzErr = sqlite3_mprintf("virtualmssql: materialization must be off|memory|temp");
+                return SQLITE_ERROR;
+            }
+        } else if (!strncmp(a, "spatial=", 8)) {
+            /* R12: spatial UDT representation: wkb (default) or wkt */
+            const char* sv = a + 8;
+            if (sv[0] == '\'') sv++;
+            if (!strncmp(sv, "wkt", 3)) spatial_wkt = 1;
+            else if (!strncmp(sv, "wkb", 3)) spatial_wkt = 0;
+            else {
+                *pzErr = sqlite3_mprintf("virtualmssql: spatial must be 'wkb' or 'wkt'");
                 return SQLITE_ERROR;
             }
         } else {
@@ -273,6 +286,22 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         strncpy_s(tab->schema, sizeof(tab->schema), schema, _TRUNCATE);
         strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
     }
+    tab->spatial_wkt = spatial_wkt;
+
+    /* R12: deterministic UNSUPPORTED_TYPE — a table whose columns contain
+     * types with no lossless mapping is rejected at CREATE time */
+    for (i = 0; i < tab->ncols; i++) {
+        if (tab->cols[i].vtype == VMS_CT_UNSUPPORTED) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: UNSUPPORTED_TYPE: column '%s' of '%s.%s' has "
+                "SQL Server type '%s' with no lossless mapping",
+                tab->cols[i].name, tab->schema, tab->table,
+                tab->cols[i].type_name);
+            sqlite3_free(tab->cols);
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+    }
 
     /* declare schema: SQL Server type -> SQLite affinity via registry.
      * declare_vtab requires a full CREATE TABLE statement. */
@@ -284,6 +313,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         case VMS_CT_INT64:  affinity = "INTEGER"; break;
         case VMS_CT_FLOAT64: affinity = "REAL"; break;
         case VMS_CT_BLOB:   affinity = "BLOB"; break;
+        case VMS_CT_SPATIAL: affinity = tab->spatial_wkt ? "TEXT" : "BLOB"; break;
         default:            affinity = "TEXT"; break; /* TEXT/DECIMAL/DATETIME/GUID/BIGTEXT */
         }
         {
@@ -614,7 +644,8 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         int sp = 0;
         int a;
         if (!vms_plan_build_sql(&plan, tab->schema, tab->table,
-                                tab->cols, tab->ncols, sql, 2048, &np)) {
+                                tab->cols, tab->ncols, tab->spatial_wkt,
+                                sql, 2048, &np)) {
             vms_pool_release(tab->env->pool, lease);
             tab->base.zErrMsg = sqlite3_mprintf("virtualmssql: plan SQL build failed");
             return SQLITE_ERROR;

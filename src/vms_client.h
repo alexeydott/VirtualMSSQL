@@ -55,8 +55,13 @@ typedef enum VmsColType {
     VMS_CT_BLOB,       /* binary/varbinary(max) */
     VMS_CT_DECIMAL,    /* decoded as exact TEXT */
     VMS_CT_DATETIME,   /* decoded as ISO TEXT */
-    VMS_CT_GUID        /* decoded as canonical TEXT */
+    VMS_CT_GUID,       /* decoded as canonical TEXT */
+    VMS_CT_SPATIAL,    /* R12: geometry/geography (WKB blob or WKT text) */
+    VMS_CT_UNSUPPORTED /* R12: sql_variant, hierarchyid, ... -> UNSUPPORTED_TYPE */
 } VmsColType;
+
+/* VMS_ERR_* class for the deterministic unsupported-type policy (R12). */
+#define VMS_ERR_UNSUPPORTED_TYPE VMS_ERR_EXEC
 
 typedef struct VmsColumnMeta {
     char name[128];    /* UTF-8 */

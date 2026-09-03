@@ -60,6 +60,41 @@ int main(void)
         L"INSERT INTO dbo.vms10_comp(ka, kb, val) VALUES(N'k1', 1, 11), (N'k2', 2, 22)",
         L"INSERT INTO dbo.vms10_rv(v) VALUES(5), (6)",
         L"INSERT INTO dbo.vms10_trg(id, v) VALUES(1, 10), (2, 20)",
+        /* R12: mandatory type matrix + spatial fixtures */
+        L"IF OBJECT_ID(N'dbo.vms12_types') IS NOT NULL DROP TABLE dbo.vms12_types;"
+        L"IF OBJECT_ID(N'dbo.vms12_spatial') IS NOT NULL DROP TABLE dbo.vms12_spatial;"
+        L"IF OBJECT_ID(N'dbo.vms12_unsup') IS NOT NULL DROP TABLE dbo.vms12_unsup",
+        L"CREATE TABLE dbo.vms12_types("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" b bit NULL, ti tinyint NULL, si smallint NULL, bi bigint NULL,"
+        L" d10 decimal(10,2) NULL, m money NULL,"
+        L" r real NULL, fl float NULL,"
+        L" ch char(10) NULL, vc varchar(50) NULL, nch nchar(10) NULL, nvc nvarchar(50) NULL,"
+        L" bin binary(4) NULL, vbin varbinary(16) NULL,"
+        L" uid uniqueidentifier NULL,"
+        L" dt date NULL, tm time NULL, dtm datetime NULL, sdt smalldatetime NULL,"
+        L" dt2 datetime2(3) NULL, dto datetimeoffset(3) NULL,"
+        L" xm xml NULL, rv rowversion)",
+        L"INSERT INTO dbo.vms12_types(id, b, ti, si, bi, d10, m, r, fl, ch, vc, nch, nvc,"
+        L" bin, vbin, uid, dt, tm, dtm, sdt, dt2, dto, xm)"
+        L" VALUES(1, 1, 255, -32768, 9223372036854775807,"
+        L" 12345678.90, -922337203685477.5808, 1.5, 2.718281828459045,"
+        L" N'left', N'varchar-v', N'nchar', N'nvarchar-v',"
+        L" 0x01020304, 0x0A0B0C0D0E0F,"
+        L" '6F9619FF-8B86-D011-B42D-00C04FC964FF',"
+        L" '2026-09-03', '12:34:56.789', '2026-09-03T10:20:30.123',"
+        L" '2026-09-03T08:15:00', '2026-09-03T10:20:30.123+02:00',"
+        L" '2026-09-03T10:20:30.1234567+02:00', N'<root><a>1</a></root>')",
+        L"INSERT INTO dbo.vms12_types(id) VALUES(2)",
+        L"CREATE TABLE dbo.vms12_spatial("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" g geometry NULL, ge geography NULL)",
+        L"INSERT INTO dbo.vms12_spatial(id, g, ge) VALUES"
+        L"(1, geometry::STGeomFromText('POINT(1 2)', 0),"
+        L"   geography::STGeomFromText('POINT(30 40)', 4326)),"
+        L"(2, geometry::STGeomFromText('LINESTRING(0 0, 10 10)', 0), NULL),"
+        L"(3, NULL, NULL)",
+        L"CREATE TABLE dbo.vms12_unsup(id int NOT NULL PRIMARY KEY, sv sql_variant NULL)",
         L"CREATE TRIGGER dbo.tr_vms10_upd ON dbo.vms10_trg AFTER UPDATE AS"
         L" UPDATE t SET v = t.v + 1 FROM dbo.vms10_trg t"
         L" JOIN inserted i ON i.id = t.id;"

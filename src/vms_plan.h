@@ -82,6 +82,7 @@ int vms_plan_deserialize(const char* buf, size_t len, VmsPlan* plan);
  * Returns 1 on success. */
 int vms_plan_build_sql(const VmsPlan* plan, const char* schema, const char* table,
                        const VmsMetaColumn* cols, int ncols,
+                       int spatial_wkt,
                        wchar_t* sql, size_t sql_chars, int* nparams);
 
 #ifdef __cplusplus

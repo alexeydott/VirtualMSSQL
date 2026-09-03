@@ -217,8 +217,52 @@ static int append_col(wchar_t* sql, size_t cap, size_t* len, const char* name)
     return append_w(sql, cap, len, w);
 }
 
+/* spatial column projection (R12): WKB binary or WKT text via the
+ * server-side STAsBinary/STAsText methods */
+static int append_col_spatial(wchar_t* sql, size_t cap, size_t* len,
+                              const char* name, int wkt)
+{
+    wchar_t w[340];
+    int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, w + 1, 296);
+    if (n <= 0) return 0;
+    w[0] = L'[';
+    w[n] = L']';
+    w[n + 1] = 0;
+    if (!append_w(sql, cap, len, w)) return 0;
+    return append_w(sql, cap, len, wkt ? L".STAsText()" : L".STAsBinary()");
+}
+
+/* projection of one column, honoring the spatial representation flag */
+static int append_col_proj(wchar_t* sql, size_t cap, size_t* len,
+                           const VmsMetaColumn* col, int spatial_wkt)
+{
+    if (col->vtype == VMS_CT_SPATIAL)
+        return append_col_spatial(sql, cap, len, col->name, spatial_wkt);
+    if (col->vtype == VMS_CT_TEXT || col->vtype == VMS_CT_BIGTEXT) {
+        /* R12: ANSI text types (char/varchar/text/xml) stream as ANSI bytes
+         * through SQLGetData(SQL_C_BINARY); force an nvarchar cast so every
+         * text column arrives as UTF-16 regardless of source collation */
+        if (!_stricmp(col->type_name, "char") || !_stricmp(col->type_name, "varchar") ||
+            !_stricmp(col->type_name, "text") || !_stricmp(col->type_name, "xml")) {
+            wchar_t w[380];
+            int n = MultiByteToWideChar(CP_UTF8, 0, col->name, -1, w + 1, 296);
+            if (n <= 0) return 0;
+            w[0] = L'[';
+            w[n] = L']';
+            w[n + 1] = 0;
+            if (!append_w(sql, cap, len, L"CAST(")) return 0;
+            if (!append_w(sql, cap, len, w)) return 0;
+            if (col->vtype == VMS_CT_BIGTEXT)
+                return append_w(sql, cap, len, L" AS nvarchar(max))");
+            return append_w(sql, cap, len, L" AS nvarchar(4000))");
+        }
+    }
+    return append_col(sql, cap, len, col->name);
+}
+
 int vms_plan_build_sql(const VmsPlan* plan, const char* schema, const char* table,
                        const VmsMetaColumn* cols, int ncols,
+                       int spatial_wkt,
                        wchar_t* sql, size_t sql_wchars, int* nparams)
 {
     size_t len = 0;
@@ -230,17 +274,22 @@ int vms_plan_build_sql(const VmsPlan* plan, const char* schema, const char* tabl
 
     if (!append_w(sql, sql_wchars, &len, L"SELECT ")) return 0;
     if (plan->used_mask == 0) {
-        if (!append_w(sql, sql_wchars, &len, L"*")) return 0;
+        /* explicit projection: "*" cannot express the ANSI-text nvarchar
+         * casts and the spatial STAsBinary/STAsText wrappers */
+        for (i = 0; i < ncols; i++) {
+            if (i && !append_w(sql, sql_wchars, &len, L", ")) return 0;
+            if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
+        }
     } else if (plan->used_mask == -1) {
         for (i = 0; i < ncols; i++) {
             if (i && !append_w(sql, sql_wchars, &len, L", ")) return 0;
-            if (!append_col(sql, sql_wchars, &len, cols[i].name)) return 0;
+            if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
         }
     } else {
         for (i = 0; i < ncols && i < 62; i++) {
             if (!(plan->used_mask & (1 << i))) continue;
             if (!first && !append_w(sql, sql_wchars, &len, L", ")) return 0;
-            if (!append_col(sql, sql_wchars, &len, cols[i].name)) return 0;
+            if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
             first = 0;
         }
         if (first && !append_w(sql, sql_wchars, &len, L"*")) return 0;
