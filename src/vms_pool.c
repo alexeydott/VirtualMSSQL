@@ -123,6 +123,11 @@ VmsConnection* vms_pool_acquire(VmsPool* pool, const VmsProfile* profile,
             *err = verr;
             return NULL;
         }
+        /* R14: profile-level query timeout applies to every statement on
+         * this connection (login timeout already came via the connstr) */
+        if (profile->query_timeout_sec > 0) {
+            vms_conn_set_query_timeout(cn, profile->query_timeout_sec);
+        }
         EnterCriticalSection(&pool->cs);
         pool->live_count++;
         LeaveCriticalSection(&pool->cs);

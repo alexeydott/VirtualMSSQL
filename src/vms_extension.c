@@ -199,6 +199,20 @@ static void cred_set_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
     sqlite3_result_null(ctx);
 }
 
+/* scalar: virtualmssql_cancel() — R14 cancellation entry point. Delivers
+ * SQLCancelHandle attention to every live remote connection and interrupts
+ * the calling SQLite VM. Returns the number of remote connections signaled
+ * (informational; cancellation is best-effort by design). */
+static void cancel_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
+{
+    int signaled;
+    (void)argc;
+    (void)argv;
+    signaled = vms_client_cancel_all();
+    sqlite3_interrupt(sqlite3_context_db_handle(ctx));
+    sqlite3_result_int(ctx, signaled);
+}
+
 static int vms_vtab_env_init(sqlite3* db, char** pzErrMsg)
 {
     VmsProfile profile;
@@ -270,6 +284,14 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
     if (sqlite3_create_function(db, "virtualmssql_cred", 2,
                                 SQLITE_UTF8, NULL,
                                 cred_set_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    /* R14: cancellation entry point — delivers attention to every live
+     * remote connection (SQLCancelHandle on the active statement) and
+     * interrupts the SQLite VM. Callable from any connection/thread. */
+    if (sqlite3_create_function(db, "virtualmssql_cancel", 0,
+                                SQLITE_UTF8, NULL,
+                                cancel_func, NULL, NULL) != SQLITE_OK) {
         return SQLITE_ERROR;
     }
     /* R6: register the real module eagerly when a profile is already

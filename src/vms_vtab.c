@@ -823,10 +823,55 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
                                        tab->cols, tab->ncols, &err);
         }
     }
-    /* the cursor owns its own HDBC; the pool lease connection itself is
-     * returned to the pool right away (it only served as the profile
-     * source) — the cursor does not hold it */
+    /* R14: conservative read-only retry — a *fresh* cursor open may be
+     * retried once on a transport/connect failure. This is safe because no
+     * row has been exposed yet (the cursor does not exist) and the read is
+     * idempotent. DML/COMMIT/ROLLBACK and any partially streamed result are
+     * NEVER retried. */
     vms_pool_release(tab->env->pool, lease);
+    lease = NULL;
+    if (!cur->cur && !txn_current(tab->env)) {
+        VmsErrClass cls = err.cls;
+        if ((cls == VMS_ERR_TRANSPORT || cls == VMS_ERR_CONNECT ||
+             cls == VMS_ERR_TIMEOUT) && !tab->is_query_source) {
+            memset(&err, 0, sizeof(err));
+            lease = vms_pool_acquire(tab->env->pool, &tab->env->profile, &err);
+            if (lease) {
+                if (have_plan) {
+                    wchar_t rsql[2048];
+                    int rnp = 0;
+                    long long rparams[VMS_PLAN_MAX_ARGS];
+                    int rsp = 0;
+                    int a2;
+                    if (vms_plan_build_sql(&plan, tab->schema, tab->table,
+                                           tab->cols, tab->ncols,
+                                           tab->spatial_wkt,
+                                           rsql, 2048, &rnp)) {
+                        if (plan.has_limit && plan.norder == 0 && !plan.has_offset)
+                            rparams[rsp++] = plan_limit;
+                        for (a2 = 0; a2 < plan.nterms; a2++) {
+                            VmsPlanTerm* t = &plan.terms[a2];
+                            if (t->op == VMS_OP_ISNULL || t->op == VMS_OP_ISNOTNULL) continue;
+                            if (t->col < 0) continue;
+                            rparams[rsp++] = term_params[a2];
+                        }
+                        if (plan.has_offset && plan.norder > 0) {
+                            rparams[rsp++] = plan_offset;
+                            rparams[rsp++] = plan_limit;
+                        } else if (plan.has_limit && plan.norder > 0) {
+                            rparams[rsp++] = plan_limit;
+                        }
+                        cur->cur = vms_cursor_open_sql(lease, rsql, rparams, rsp, &err);
+                    }
+                } else {
+                    cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
+                                               tab->cols, tab->ncols, &err);
+                }
+                vms_pool_release(tab->env->pool, lease);
+                lease = NULL;
+            }
+        }
+    }
     if (!cur->cur) {
         vtab_set_error(&tab->base, &err);
         return SQLITE_ERROR;

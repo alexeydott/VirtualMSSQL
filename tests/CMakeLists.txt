@@ -195,6 +195,18 @@ add_dependencies(test_r13 virtualmssql)
 add_test(NAME r13
     COMMAND test_r13 $<TARGET_FILE:virtualmssql>)
 
+# ---- suite 17: cancellation / timeout / resilience (G14; live server) ----
+add_executable(test_r14 test_r14.c)
+target_include_directories(test_r14 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_link_libraries(test_r14 PRIVATE vms_test_harness vms_client)
+target_compile_options(test_r14 PRIVATE /utf-8)
+add_dependencies(test_r14 virtualmssql)
+add_test(NAME r14
+    COMMAND test_r14 $<TARGET_FILE:virtualmssql>)
+
 # seed helper (not a test): creates R6 fixtures on the live server
 add_executable(seed_r6 seed_r6.c)
 target_link_libraries(seed_r6 PRIVATE vms_client)

@@ -13,6 +13,7 @@
 #include <sql.h>
 #include <sqlext.h>
 #include <sqlucode.h>
+#include <process.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -116,6 +117,9 @@ struct VmsConnection {
     volatile LONG quarantined;
     volatile LONG txn_active;   /* R11: remote transaction open */
     volatile LONG txn_pinned;   /* R11: manual-commit mode + primer applied */
+    int query_timeout_sec;  /* R14: 0 = none; applied to new statements */
+    volatile LONG deadline_fired;    /* R14: armed deadline exceeded */
+    volatile LONG deadline_watchers; /* R14: bounded one-shot watchers */
     wchar_t* last_connstr;  /* kept for cursor leases (R6) */
 };
 
@@ -718,6 +722,64 @@ void vms_client_destroy(VmsClient* c)
     HeapFree(GetProcessHeap(), 0, c);
 }
 
+/* ---- R14: process-wide live connection registry (for cancel-all) ----
+ * Every open VmsConnection is registered here; vms_client_cancel_all()
+ * delivers attention to the active statement of each. The registry is a
+ * singly linked list guarded by a critical section. */
+static CRITICAL_SECTION g_connreg_cs;
+static INIT_ONCE g_connreg_once = INIT_ONCE_STATIC_INIT;
+static int g_connreg_cs_init = 0;
+
+struct ConnRegNode {
+    VmsConnection* cn;
+    struct ConnRegNode* next;
+};
+static struct ConnRegNode* g_connreg_head = NULL;
+
+static BOOL CALLBACK connreg_init(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_connreg_cs);
+    g_connreg_cs_init = 1;
+    return TRUE;
+}
+
+static void connreg_ensure(void)
+{
+    InitOnceExecuteOnce(&g_connreg_once, connreg_init, NULL, NULL);
+}
+
+static void connreg_add(VmsConnection* cn)
+{
+    struct ConnRegNode* n;
+    connreg_ensure();
+    n = (struct ConnRegNode*)HeapAlloc(GetProcessHeap(), 0, sizeof(*n));
+    if (!n) return; /* cancel-all just misses this connection */
+    n->cn = cn;
+    EnterCriticalSection(&g_connreg_cs);
+    n->next = g_connreg_head;
+    g_connreg_head = n;
+    LeaveCriticalSection(&g_connreg_cs);
+}
+
+static void connreg_remove(VmsConnection* cn)
+{
+    struct ConnRegNode** pp;
+    connreg_ensure();
+    EnterCriticalSection(&g_connreg_cs);
+    pp = &g_connreg_head;
+    while (*pp) {
+        if ((*pp)->cn == cn) {
+            struct ConnRegNode* dead = *pp;
+            *pp = dead->next;
+            HeapFree(GetProcessHeap(), 0, dead);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    LeaveCriticalSection(&g_connreg_cs);
+}
+
 VmsConnection* vms_conn_open(VmsClient* c, const wchar_t* connstr_w, VmsError* err)
 {
     VmsConnection* cn;
@@ -762,6 +824,7 @@ VmsConnection* vms_conn_open(VmsClient* c, const wchar_t* connstr_w, VmsError* e
         cn->last_connstr = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(wchar_t));
         if (cn->last_connstr) memcpy(cn->last_connstr, connstr_w, n * sizeof(wchar_t));
     }
+    connreg_add(cn);
     /* manual-transaction mode is opt-in via vms_tran_begin(); default
      * connection stays in autocommit (SQLite drives transaction timing) */
     return cn;
@@ -770,6 +833,7 @@ VmsConnection* vms_conn_open(VmsClient* c, const wchar_t* connstr_w, VmsError* e
 void vms_conn_close(VmsConnection* cn)
 {
     if (!cn) return;
+    connreg_remove(cn);
     if (cn->worker) vms_worker_stop(cn->worker);
     if (cn->hdbc) {
         SQLDisconnect(cn->hdbc);
@@ -782,9 +846,108 @@ void vms_conn_close(VmsConnection* cn)
     HeapFree(GetProcessHeap(), 0, cn);
 }
 
+static void job_query_timeout(void* arg)
+{
+    OpSimple* op = (OpSimple*)arg;
+    SQLRETURN r;
+    vms_error_ok(op->err);
+    r = SQLSetConnectAttr(op->cn->hdbc, SQL_ATTR_QUERY_TIMEOUT,
+                          (SQLPOINTER)(SIZE_T)op->cn->query_timeout_sec, 0);
+    if (!SQL_SUCCEEDED(r)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_DBC, op->cn->hdbc, "query timeout", &q);
+        op->ok = 0;
+        return;
+    }
+    op->ok = 1;
+}
+
+int vms_conn_set_query_timeout(VmsConnection* cn, int seconds)
+{
+    OpSimple op;
+    if (!cn || seconds < 0) return 0;
+    cn->query_timeout_sec = seconds;
+    op.cn = cn;
+    op.err = NULL;
+    op.ok = 0;
+    {
+        VmsError scratch;
+        op.err = &scratch;
+        vms_worker_run(cn->worker, job_query_timeout, &op);
+    }
+    return op.ok;
+}
+
+int vms_client_cancel_all(void)
+{
+    struct ConnRegNode* n;
+    int signaled = 0;
+    connreg_ensure();
+    /* snapshot under lock, cancel outside: cancel may take the worker's
+     * internals briefly; no adapter lock is held during SQLCancelHandle */
+    EnterCriticalSection(&g_connreg_cs);
+    for (n = g_connreg_head; n; n = n->next) {
+        vms_worker_cancel_active(n->cn->worker);
+        signaled++;
+    }
+    LeaveCriticalSection(&g_connreg_cs);
+    return signaled;
+}
+
 int vms_conn_quarantined(const VmsConnection* cn)
 {
     return cn ? (int)InterlockedCompareExchange((volatile LONG*)&cn->quarantined, 0, 0) : 0;
+}
+
+/* ---- R14: monotonic operation deadline (watcher thread) ---- */
+
+struct VmsDeadline {
+    VmsConnection* cn;
+    unsigned int ms;
+};
+
+/* one-shot watcher: sleeps `ms`, then cancels the active statement and
+ * marks the deadline fired; the connection object outlives the watcher
+ * because the owner joins the thread before closing the connection */
+static unsigned __stdcall deadline_watch(void* arg)
+{
+    struct VmsDeadline* d = (struct VmsDeadline*)arg;
+    VmsConnection* cn = d->cn;
+    Sleep(d->ms);
+    /* cancel whatever is running now (no-op when idle) */
+    vms_worker_cancel_active(cn->worker);
+    InterlockedExchange(&cn->deadline_fired, 1);
+    InterlockedDecrement(&cn->deadline_watchers);
+    HeapFree(GetProcessHeap(), 0, d);
+    _endthreadex(0);
+    return 0;
+}
+
+int vms_conn_arm_deadline(VmsConnection* cn, unsigned int ms)
+{
+    struct VmsDeadline* d;
+    uintptr_t th;
+    if (!cn || ms == 0) return 0;
+    if (cn->deadline_watchers >= 4) return 0; /* bounded watchers */
+    d = (struct VmsDeadline*)HeapAlloc(GetProcessHeap(), 0, sizeof(*d));
+    if (!d) return 0;
+    d->cn = cn;
+    d->ms = ms;
+    InterlockedExchange(&cn->deadline_fired, 0);
+    InterlockedIncrement(&cn->deadline_watchers);
+    th = _beginthreadex(NULL, 0, deadline_watch, d, 0, NULL);
+    if (!th) {
+        InterlockedDecrement(&cn->deadline_watchers);
+        HeapFree(GetProcessHeap(), 0, d);
+        return 0;
+    }
+    CloseHandle((HANDLE)th); /* detached one-shot; ownership by design */
+    return 1;
+}
+
+int vms_conn_deadline_fired(VmsConnection* cn)
+{
+    return cn ? (int)InterlockedCompareExchange(&cn->deadline_fired, 0, 0) : 0;
 }
 
 static VmsStatement* stmt_alloc(VmsConnection* cn)

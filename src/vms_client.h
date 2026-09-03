@@ -74,11 +74,28 @@ typedef struct VmsColumnMeta {
 /* ---- client (environment owner) ---- */
 VmsClient* vms_client_init(VmsError* err);
 void vms_client_destroy(VmsClient* c);
+/* R14: deliver attention (SQLCancelHandle on the active statement) to every
+ * live connection in the process — the machinery behind the
+ * virtualmssql_cancel() scalar. Returns the number of connections signaled.
+ * Thread-safe; safe to call while other threads are blocked in ODBC. */
+int vms_client_cancel_all(void);
 
 /* ---- connection ----
  * connstr_w is the strict connection string (UTF-16). The adapter appends
  * nothing: the caller owns the exact bytes. */
 VmsConnection* vms_conn_open(VmsClient* c, const wchar_t* connstr_w, VmsError* err);
+/* R14: apply the query timeout (seconds; 0 = none) to this connection; new
+ * statements inherit it via SQL_ATTR_QUERY_TIMEOUT. Returns 1 on success. */
+int vms_conn_set_query_timeout(VmsConnection* cn, int seconds);
+/* R14: arm a monotonic deadline for the next blocking operation: after
+ * `ms` milliseconds the currently active statement receives a cancel and
+ * the connection reports VMS_ERR_TIMEOUT until the deadline is cleared by
+ * the operation itself (deadline fires at most once per arming). Returns 1
+ * when the watcher was armed. */
+int vms_conn_arm_deadline(VmsConnection* cn, unsigned int ms);
+/* R14: 1 when the armed deadline fired (the operation exceeded its
+ * monotonic budget); reading clears the flag. */
+int vms_conn_deadline_fired(VmsConnection* cn);
 void vms_conn_close(VmsConnection* cn);
 int vms_conn_quarantined(const VmsConnection* cn);
 /* reset quarantine decision point (R14 policy; R3 only reports) */
