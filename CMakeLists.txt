@@ -29,6 +29,7 @@ add_library(vms_client STATIC
     src/vms_lexer.c
     src/vms_query_source.c
     src/vms_mat.c
+    src/vms_dml.c
     src/vms_vtab.c
 )
 target_include_directories(vms_client PUBLIC

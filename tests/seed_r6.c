@@ -16,6 +16,13 @@ int main(void)
     VmsStatement* st;
     const char* spec = getenv("VMS_TEST_PROFILE");
     static const wchar_t* ddl[] = {
+        L"IF OBJECT_ID(N'dbo.vms10_dml') IS NOT NULL DROP TABLE dbo.vms10_dml;"
+        L"IF OBJECT_ID(N'dbo.vms10_conf') IS NOT NULL DROP TABLE dbo.vms10_conf;"
+        L"IF OBJECT_ID(N'dbo.vms10_trg') IS NOT NULL DROP TABLE dbo.vms10_trg;"
+        L"IF OBJECT_ID(N'dbo.vms10_trg_log') IS NOT NULL DROP TABLE dbo.vms10_trg_log;"
+        L"IF OBJECT_ID(N'dbo.vms10_comp') IS NOT NULL DROP TABLE dbo.vms10_comp;"
+        L"IF OBJECT_ID(N'dbo.vms10_rv') IS NOT NULL DROP TABLE dbo.vms10_rv;"
+        L"IF OBJECT_ID(N'dbo.vms10_io_trg') IS NOT NULL DROP VIEW dbo.vms10_io_trg;"
         L"IF OBJECT_ID(N'dbo.vms7_data') IS NOT NULL DROP TABLE dbo.vms7_data;"
         L"IF OBJECT_ID(N'dbo.vms6_view') IS NOT NULL DROP VIEW dbo.vms6_view;"
         L"IF OBJECT_ID(N'dbo.vms6_t_empty') IS NOT NULL DROP TABLE dbo.vms6_t_empty;"
@@ -23,6 +30,41 @@ int main(void)
         L"IF OBJECT_ID(N'dbo.vms6_t_lob') IS NOT NULL DROP TABLE dbo.vms6_t_lob;"
         L"IF OBJECT_ID(N'dbo.vms6_t_all') IS NOT NULL DROP TABLE dbo.vms6_t_all;"
         L"IF OBJECT_ID(N'dbo.vms6_t_int') IS NOT NULL DROP TABLE dbo.vms6_t_int",
+        /* R10: DML fixtures with every key shape */
+        L"CREATE TABLE dbo.vms10_dml("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" name nvarchar(50) NOT NULL,"
+        L" val int NULL,"
+        L" txt nvarchar(100) NULL)",
+        L"CREATE TABLE dbo.vms10_conf("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" rv rowversion,"
+        L" val int NULL)",
+        L"CREATE TABLE dbo.vms10_trg("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" v int NOT NULL)",
+        L"CREATE TABLE dbo.vms10_trg_log(id int NOT NULL PRIMARY KEY, v int NOT NULL)",
+        L"CREATE TABLE dbo.vms10_comp("
+        L" ka nvarchar(20) NOT NULL,"
+        L" kb int NOT NULL,"
+        L" val int NULL,"
+        L" CONSTRAINT pk_vms10_comp PRIMARY KEY (ka, kb))",
+        L"CREATE TABLE dbo.vms10_rv("
+        L" id uniqueidentifier NOT NULL PRIMARY KEY DEFAULT NEWID(),"
+        L" v int NULL)",
+        L"CREATE VIEW dbo.vms10_io_trg AS SELECT id, v FROM dbo.vms10_trg",
+        L"INSERT INTO dbo.vms10_dml(id, name, val, txt) VALUES"
+        L"(1, N'one', 10, N'text-one'), (2, N'two', 20, N'text-two'),"
+        L"(3, N'three', 30, NULL)",
+        L"INSERT INTO dbo.vms10_conf(id, val) VALUES(1, 100), (2, 200)",
+        L"INSERT INTO dbo.vms10_comp(ka, kb, val) VALUES(N'k1', 1, 11), (N'k2', 2, 22)",
+        L"INSERT INTO dbo.vms10_rv(v) VALUES(5), (6)",
+        L"INSERT INTO dbo.vms10_trg(id, v) VALUES(1, 10), (2, 20)",
+        L"CREATE TRIGGER dbo.tr_vms10_upd ON dbo.vms10_trg AFTER UPDATE AS"
+        L" UPDATE t SET v = t.v + 1 FROM dbo.vms10_trg t"
+        L" JOIN inserted i ON i.id = t.id;"
+        L" INSERT INTO dbo.vms10_trg_log(id, v) SELECT i.id, i.v + 1"
+        L" FROM inserted i",
         L"CREATE TABLE dbo.vms7_data(a int NOT NULL PRIMARY KEY, b nvarchar(50) NOT NULL, c int NULL)",
         L"INSERT INTO dbo.vms7_data(a, b, c) VALUES"
         L"(-3, N'alpha', NULL), (1, N'bravo', 10), (2, N'charlie', NULL),"

@@ -945,6 +945,184 @@ int vms_conn_cancel(VmsConnection* cn)
     return 1;
 }
 
+/* ---- R10 DML execution (adapter-side; values are bound, never inline) ---- */
+
+typedef struct OpDml {
+    VmsConnection* cn;
+    const wchar_t* sql;
+    const long long* iparams;
+    int nint;
+    const wchar_t* const* tparams;
+    const int* tlengths;
+    int ntext;
+    const int* torder;
+    int ntotal;
+    long long rows;
+    VmsError* err;
+    int ok;
+} OpDml;
+
+static void job_dml(void* arg)
+{
+    OpDml* op = (OpDml*)arg;
+    SQLHSTMT h = SQL_NULL_HSTMT;
+    SQLRETURN r;
+    SQLLEN rows = 0;
+    long long* ival_holders = NULL;
+    wchar_t** tval_holders = NULL;
+    SQLLEN* inds = NULL;
+    int i;
+
+    vms_error_ok(op->err);
+    if (InterlockedCompareExchange(&op->cn->quarantined, 0, 0)) {
+        vms_error_set(op->err, VMS_ERR_QUARANTINED, NULL, 0, "connection quarantined");
+        return;
+    }
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &h))) {
+        vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM dml stmt");
+        return;
+    }
+    /* holders live until after SQLExecDirect (deferred binding) */
+    if (op->nint > 0) {
+        ival_holders = (long long*)HeapAlloc(GetProcessHeap(), 0,
+                                             sizeof(long long) * (size_t)op->nint);
+        inds = (SQLLEN*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                  sizeof(SQLLEN) * (size_t)op->ntotal);
+        if (!ival_holders || !inds) goto fail_oom;
+    }
+    if (op->ntext > 0) {
+        tval_holders = (wchar_t**)HeapAlloc(GetProcessHeap(), 0,
+                                            sizeof(wchar_t*) * (size_t)op->ntext);
+        if (!tval_holders) goto fail_oom;
+        for (i = 0; i < op->ntext; i++) {
+            int chars = op->tlengths ? op->tlengths[i] : 0;
+            tval_holders[i] = (wchar_t*)HeapAlloc(GetProcessHeap(), 0,
+                (size_t)(chars + 1) * sizeof(wchar_t));
+            if (!tval_holders[i]) goto fail_oom;
+            memcpy(tval_holders[i], op->tparams[i],
+                   (size_t)chars * sizeof(wchar_t));
+            tval_holders[i][chars] = 0;
+        }
+    }
+
+    /* bind in statement order per torder */
+    for (i = 0; i < op->ntotal; i++) {
+        SQLRETURN br;
+        int t = op->torder[i];
+        if (t >= 0) {
+            /* int param t */
+            SQLBIGINT v = (SQLBIGINT)op->iparams[t];
+            ival_holders[t] = v;
+            inds[i] = sizeof(SQLBIGINT); /* fixed-length: size, not NULL */
+            br = SQLBindParameter(h, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
+                                  SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                                  (SQLPOINTER)&ival_holders[t], 0, &inds[i]);
+        } else {
+            /* text param -(t)-1 */
+            int ti = -t - 1;
+            SQLULEN unlimited = 1073741823; /* R0: max accepted precision */
+            wchar_t* hv = tval_holders[ti];
+            int chars = op->tlengths ? op->tlengths[ti] : (int)wcslen(hv);
+            if (chars == 0) {
+                /* empty string bound as NULL when the caller marked it so */
+                inds[i] = SQL_NULL_DATA;
+                br = SQLBindParameter(h, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
+                                      SQL_C_WCHAR, SQL_WVARCHAR, 1, 0,
+                                      (SQLPOINTER)L"", 0, &inds[i]);
+            } else {
+                inds[i] = (SQLLEN)(chars * sizeof(wchar_t));
+                br = SQLBindParameter(h, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
+                                      SQL_C_WCHAR, SQL_WLONGVARCHAR, unlimited, 0,
+                                      hv, 0, &inds[i]);
+            }
+        }
+        if (!SQL_SUCCEEDED(br)) {
+            int q;
+            diag_capture(op->err, SQL_HANDLE_STMT, h, "SQLBindParameter", &q);
+            goto fail;
+        }
+    }
+
+    vms_worker_set_active(op->cn->worker, h);
+    r = SQLExecDirectW(h, (SQLWCHAR*)op->sql, SQL_NTS);
+    vms_worker_set_active(op->cn->worker, NULL);
+    if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO || r == SQL_NO_DATA)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_STMT, h, "DML execute", &q);
+        goto fail;
+    }
+    if (!SQL_SUCCEEDED(SQLRowCount(h, &rows))) rows = -1;
+    SQLFreeStmt(h, SQL_CLOSE);
+    SQLFreeHandle(SQL_HANDLE_STMT, h);
+    /* free holders */
+    if (ival_holders) HeapFree(GetProcessHeap(), 0, ival_holders);
+    if (inds) HeapFree(GetProcessHeap(), 0, inds);
+    if (tval_holders) {
+        for (i = 0; i < op->ntext; i++)
+            if (tval_holders[i]) HeapFree(GetProcessHeap(), 0, tval_holders[i]);
+        HeapFree(GetProcessHeap(), 0, tval_holders);
+    }
+    op->rows = (long long)rows;
+    /* defensive: ensure the DML statement left no open implicit transaction
+     * (SQLNumResultCols/row-count edge cases with this driver); commit any
+     * pending work so autocommit semantics hold for the connection */
+    {
+        SQLHSTMT h2 = SQL_NULL_HSTMT;
+        if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &h2))) {
+            SQLExecDirectW(h2, (SQLWCHAR*)L"IF @@TRANCOUNT > 0 COMMIT TRAN", SQL_NTS);
+            SQLFreeHandle(SQL_HANDLE_STMT, h2);
+        }
+    }
+    op->ok = 1;
+    return;
+
+fail_oom:
+    vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM dml holders");
+fail:
+    if (h != SQL_NULL_HSTMT) {
+        SQLFreeStmt(h, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, h);
+    }
+    if (ival_holders) HeapFree(GetProcessHeap(), 0, ival_holders);
+    if (inds) HeapFree(GetProcessHeap(), 0, inds);
+    if (tval_holders) {
+        for (i = 0; i < op->ntext; i++)
+            if (tval_holders[i]) HeapFree(GetProcessHeap(), 0, tval_holders[i]);
+        HeapFree(GetProcessHeap(), 0, tval_holders);
+    }
+    op->ok = 0;
+}
+
+int vms_conn_exec_dml(VmsConnection* cn, const wchar_t* sql,
+                      const long long* iparams, int nint,
+                      const wchar_t* const* tparams, const int* tlengths, int ntext,
+                      const int* torder, int ntotal,
+                      long long* rows_affected, VmsError* err)
+{
+    OpDml op;
+    if (!cn || !sql) {
+        vms_error_set(err, VMS_ERR_INVALID_ARG, NULL, 0, "exec_dml: bad args");
+        return -1;
+    }
+    op.cn = cn;
+    op.sql = sql;
+    op.iparams = iparams;
+    op.nint = nint;
+    op.tparams = tparams;
+    op.tlengths = tlengths;
+    op.ntext = ntext;
+    op.torder = torder;
+    op.ntotal = ntotal;
+    op.rows = -1;
+    op.err = err;
+    op.ok = 0;
+    vms_error_ok(err);
+    vms_worker_run(cn->worker, job_dml, &op);
+    if (!op.ok) return -1;
+    if (rows_affected) *rows_affected = op.rows;
+    return 0;
+}
+
 int vms_tran_begin(VmsConnection* cn, VmsError* err)
 {
     OpSimple op;
@@ -1419,6 +1597,7 @@ const VmsValue* vms_cursor_value(const VmsCursor* cur, int col)
     if (!cur || !cur->row_ready || col < 0 || col >= cur->col_count) return NULL;
     return &cur->row[col];
 }
+
 
 
 

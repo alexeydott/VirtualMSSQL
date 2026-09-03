@@ -118,6 +118,17 @@ int vms_tran_rollback(VmsConnection* cn, VmsError* err);
  * Connection reuse is allowed only with a proven clean state. */
 int vms_conn_verify(VmsConnection* cn);
 
+/* ---- DML execution (R10 write path; adapter-side) ----
+ * Execute a parameterized DML statement. ntotal SQL slots are filled in
+ * statement order: torder[i] >= 0 -> int param torder[i]; torder[i] < 0 ->
+ * text param -(torder[i])-1. rows_affected receives SQLRowCount (-1 on
+ * failure). Values reach the server only as bound parameters. */
+int vms_conn_exec_dml(VmsConnection* cn, const wchar_t* sql,
+                      const long long* iparams, int nint,
+                      const wchar_t* const* tparams, const int* tlengths, int ntext,
+                      const int* torder, int ntotal,
+                      long long* rows_affected, VmsError* err);
+
 /* ---- vtab read cursor (R6) ----
  * A cursor is an independent lease over its own ODBC connection lease:
  * two cursors scan concurrently (SQLite nested scans) without sharing

@@ -13,6 +13,7 @@
 #include "vms_plan.h"
 #include "vms_query_source.h"
 #include "vms_mat.h"
+#include "vms_dml.h"
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,6 +39,15 @@ struct VmsVtab {
     /* R9: materialization (query sources only) */
     VmsMatMode mat_mode;
     VmsMat* mat;           /* published snapshot; guarded by SQLite core */
+    /* R10: write mode (table sources only) */
+    int rw_mode;
+    VmsDmlContext* dml;    /* prepared lazily; requires a stable key */
+    /* R10: stable-key values of the last row positioned by xRowid (stash
+     * for xUpdate WHERE clauses: DELETE has no cursor access in xUpdate,
+     * but SQLite always calls xRowid right before DELETE/UPDATE) */
+    char key_text[VMS_META_MAX_KEY_PARTS][160];
+    int key_part_col[VMS_META_MAX_KEY_PARTS]; /* key part -> vtab col index */
+    int key_have;
 };
 
 struct VmsVtab;
@@ -87,6 +97,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     int i;
     int rc = SQLITE_ERROR;
     int is_query = 0;
+    int rw = 0;
     int mat_mode_parsed = VMS_MAT_OFF;
 
     (void)argc;
@@ -110,6 +121,15 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
                 return SQLITE_ERROR;
             }
             is_query = !strncmp(sv, "query", 5);
+        } else if (!strncmp(a, "mode=", 5)) {
+            const char* mv = a + 5;
+            if (mv[0] == '\'') mv++;
+            if (strncmp(mv, "rw", 2) && strncmp(mv, "ro", 2) &&
+                strncmp(mv, "rw'", 3) && strncmp(mv, "ro'", 3)) {
+                *pzErr = sqlite3_mprintf("virtualmssql: mode must be 'ro' or 'rw'");
+                return SQLITE_ERROR;
+            }
+            rw = !strncmp(mv, "rw", 2);
         } else if (!strncmp(a, "query=", 6)) {
             query = a + 6;
         } else if (!strncmp(a, "materialization=", 16)) {
@@ -212,6 +232,14 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     }
     if (is_query) {
         tab->mat_mode = (VmsMatMode)mat_mode_parsed;
+        if (rw) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: mode=rw is only valid for source=table");
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+    } else {
+        tab->rw_mode = rw;
     }
     tab->cols = (VmsMetaColumn*)sqlite3_malloc(sizeof(VmsMetaColumn) * (size_t)tab->ncols);
     if (!tab->cols) {
@@ -274,6 +302,11 @@ static int vms_vtab_disconnect(sqlite3_vtab* vtab)
     struct VmsVtab* tab = (struct VmsVtab*)vtab;
     if (tab->is_query_source) vms_query_source_free(&tab->qsrc);
     if (tab->mat) vms_mat_destroy(tab->mat);
+    if (tab->dml) {
+        /* the DML context owns its dedicated lease connection */
+        if (tab->dml->cn) vms_conn_close(tab->dml->cn);
+        HeapFree(GetProcessHeap(), 0, tab->dml);
+    }
     if (tab->cols) sqlite3_free(tab->cols);
     sqlite3_free(tab);
     return SQLITE_OK;
@@ -301,6 +334,24 @@ static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
         info->idxNum = 0;
         return SQLITE_OK;
     }
+    /* R10: for writable tables the stable-key columns must always be part of
+     * the projection (xRowid stashes them for xUpdate WHERE clauses) */
+    if (tab->rw_mode) {
+        VmsDmlContext* d;
+        VmsError derr;
+        memset(&derr, 0, sizeof(derr));
+        if (vtab_dml_ctx(tab, &d, &derr)) {
+            int k, j;
+            for (k = 0; k < d->key.part_count; k++) {
+                for (j = 0; j < tab->ncols; j++) {
+                    if (!_stricmp(tab->cols[j].name, d->key.parts[k].name) &&
+                        j < 62) {
+                        plan.used_mask |= (1 << j);
+                    }
+                }
+            }
+        }
+    }
     if (!vms_plan_serialize(&plan, buf, sizeof(buf))) {
         info->estimatedCost = 1000000.0;
         info->estimatedRows = 100000;
@@ -318,6 +369,8 @@ static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
 }
 
 /* ---------- xOpen / xClose / xFilter / xNext / xEof / xColumn / xRowid --- */
+
+static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err);
 
 static int vms_vtab_open(sqlite3_vtab* vtab, sqlite3_vtab_cursor** ppCursor)
 {
@@ -720,7 +773,216 @@ static int vms_vtab_column(sqlite3_vtab_cursor* cursor, sqlite3_context* ctx,
 
 static int vms_vtab_rowid(sqlite3_vtab_cursor* cursor, sqlite3_int64* pRowid)
 {
-    *pRowid = ((struct VmsVtabCursor*)cursor)->rowid_counter;
+    /* R10: for DELETE support the rowid must identify the remote row.
+     * xUpdate receives this value in argv[0]; the write path re-reads the
+     * row by the stable key, so we surface the first integer key column
+     * when possible; otherwise the scan position (read-only usage). */
+    struct VmsVtabCursor* cur = (struct VmsVtabCursor*)cursor;
+    struct VmsVtab* tab = cur->tab;
+    /* R10: stash all stable-key values of the current row so xUpdate can
+     * rebuild the WHERE clause for GUID/composite/string keys. */
+    tab->key_have = 0;
+    if (cur->cur && tab->ncols > 0 && tab->rw_mode) {
+        VmsDmlContext* d;
+        VmsError derr;
+        memset(&derr, 0, sizeof(derr));
+        if (vtab_dml_ctx(tab, &d, &derr)) {
+            int k;
+            tab->key_have = 1;
+            for (k = 0; k < d->key.part_count; k++) {
+                int j, mapped = -1;
+                for (j = 0; j < tab->ncols; j++) {
+                    if (cur->col_map[j] >= 0 &&
+                        !_stricmp(tab->cols[j].name, d->key.parts[k].name)) {
+                        mapped = j; break;
+                    }
+                }
+                if (mapped < 0) { tab->key_have = 0; break; }
+                {
+                    const VmsValue* v =
+                        vms_cursor_value(cur->cur, cur->col_map[mapped]);
+                    if (!v || v->type == VMS_VAL_NULL) { tab->key_have = 0; break; }
+                    if (v->type == VMS_VAL_INT64)
+                        _snprintf_s(tab->key_text[k], sizeof(tab->key_text[k]),
+                                    _TRUNCATE, "%lld", v->i);
+                    else if (v->type == VMS_VAL_FLOAT64)
+                        _snprintf_s(tab->key_text[k], sizeof(tab->key_text[k]),
+                                    _TRUNCATE, "%.17g", v->f);
+                    else if (v->type == VMS_VAL_TEXT) {
+                        size_t n = v->text_len < 159 ? v->text_len : 159;
+                        memcpy(tab->key_text[k], v->text, n);
+                        tab->key_text[k][n] = 0;
+                    } else { tab->key_have = 0; break; }
+                }
+            }
+        }
+    }
+    if (cur->cur && tab->ncols > 0) {
+        int k, j;
+        for (k = 0; k < 1; k++) {
+            /* first key part that is an integer column (R5 key order) */
+            for (j = 0; j < tab->ncols; j++) {
+                const VmsValue* v;
+                if (cur->col_map[j] < 0) continue;
+                if (tab->cols[j].vtype != VMS_CT_INT64) continue;
+                v = vms_cursor_value(cur->cur, cur->col_map[j]);
+                if (v && v->type == VMS_VAL_INT64) { *pRowid = (sqlite3_int64)v->i; return SQLITE_OK; }
+                break;
+            }
+            break;
+        }
+    }
+    *pRowid = cur->rowid_counter;
+    return SQLITE_OK;
+}
+
+/* ---------- R10 xUpdate (write path) ---------- */
+
+/* per-xUpdate state for the value callback */
+typedef struct UpdateVals {
+    sqlite3_value** argv;   /* xUpdate argv */
+    int argc;
+} UpdateVals;
+
+static const char* upd_value_get(void* user, int col, int* is_null)
+{
+    UpdateVals* u = (UpdateVals*)user;
+    sqlite3_value* v;
+    *is_null = 0;
+    if (!u || col < 0 || col + 2 >= u->argc) { *is_null = 1; return NULL; }
+    /* xUpdate argv layout: [0]=old rowid, [1]=new rowid, [2..nCol+1]=column
+     * values (argc == nCol + 2) */
+    v = u->argv[col + 2];
+    if (sqlite3_value_type(v) == SQLITE_NULL) { *is_null = 1; return NULL; }
+    return (const char*)sqlite3_value_text(v);
+}
+
+/* key value callback: reads from the xRowid stash (old key values) */
+static const char* upd_key_stash_get(void* user, int col, int* is_null)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)user;
+    int part;
+    *is_null = 0;
+    if (!tab || !tab->key_have || col < 0 || col >= tab->ncols) {
+        *is_null = 1;
+        return NULL;
+    }
+    for (part = 0; part < VMS_META_MAX_KEY_PARTS; part++) {
+        if (tab->key_part_col[part] == col)
+            return tab->key_text[part];
+    }
+    *is_null = 1;
+    return NULL;
+}
+
+/* lazily prepare the DML context (validates the stable key once). The
+ * context owns a dedicated connection (acquired from the env pool once and
+ * kept for the vtab's lifetime) used for all writes. */
+static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err)
+{
+    VmsConnection* lease;
+
+    if (tab->dml) { *out = tab->dml; return 1; }
+    if (!tab->rw_mode) return 0;
+    lease = vms_pool_acquire(tab->env->pool, &tab->env->profile, err);
+    if (!lease) return 0;
+    {
+        VmsDmlContext* d =
+            (VmsDmlContext*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                      sizeof(VmsDmlContext));
+        if (d && vms_dml_init(d, lease, tab->schema, tab->table,
+                              tab->cols, tab->ncols, err)) {
+            int k, j;
+            tab->dml = d;
+            for (k = 0; k < d->key.part_count; k++) {
+                tab->key_part_col[k] = -1;
+                for (j = 0; j < tab->ncols; j++) {
+                    if (!_stricmp(tab->cols[j].name, d->key.parts[k].name)) {
+                        tab->key_part_col[k] = j;
+                        break;
+                    }
+                }
+            }
+            *out = d;
+            /* the lease is owned by the context now: released at
+             * xDisconnect via vms_conn_close (bypassing the pool, so the
+             * write connection is never reused for reads) */
+            return 1;
+        }
+        if (d) HeapFree(GetProcessHeap(), 0, d);
+    }
+    vms_pool_release(tab->env->pool, lease);
+    return 0;
+}
+
+static int vms_vtab_update(sqlite3_vtab* vtab, int argc, sqlite3_value** argv,
+                           sqlite3_int64* pRowid)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsDmlContext* d = NULL;
+    VmsError err;
+    UpdateVals uv;
+    long long rows = 0;
+    int r = 0;
+
+    memset(&err, 0, sizeof(err));
+    r = 0;
+
+    if (!tab->rw_mode) {
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: writes require mode=rw (this vtab is read-only)");
+        return SQLITE_READONLY;
+    }
+    if (tab->is_query_source) {
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: writes are not supported for source=query");
+        return SQLITE_READONLY;
+    }
+    if (!vtab_dml_ctx(tab, &d, &err)) {
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: no usable stable key on '%s.%s': writes rejected",
+            tab->schema, tab->table);
+        return SQLITE_ERROR;
+    }
+
+    uv.argv = argv;
+    uv.argc = argc;
+
+    if (argc == 1) {
+        /* DELETE: argv[0] = the rowid surfaced by xRowid; the WHERE clause
+         * is rebuilt from the stashed stable-key values (works for
+         * GUID/composite/string keys too, not just integer rowids). */
+        r = vms_dml_delete(d, upd_key_stash_get, tab, upd_value_get, &uv,
+                           &rows, &err);
+        if (r < 0) {
+            vtab_set_error(vtab, &err);
+            return SQLITE_ERROR;
+        }
+        if (rows == 0) {
+            vtab->zErrMsg = sqlite3_mprintf(
+                "virtualmssql: concurrent modification detected (0 rows deleted)");
+            return SQLITE_BUSY_SNAPSHOT;
+        }
+        return SQLITE_OK;
+    } else if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        /* INSERT: argv[1..ncols] = new values */
+        r = vms_dml_insert(d, NULL, upd_value_get, &uv, &rows, &err);
+    } else {
+        /* UPDATE: argv[0] = old rowid, argv[1..ncols] = new values; the
+         * WHERE clause uses the stashed *old* key values, never the new
+         * ones (a key change must not retarget the row) */
+        r = vms_dml_update(d, NULL, upd_key_stash_get, tab,
+                           upd_value_get, &uv, &rows, &err);
+    }
+
+    if (r < 0) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    /* NOTE: optimistic-lock conflict detection via SQLRowCount==0 proved
+     * unreliable with this driver (0 is reported even for successful
+     * INSERT); conflict detection moves to the R11 transaction layer using
+     * the rowversion token. Here, success = no server error. */
     return SQLITE_OK;
 }
 
@@ -740,6 +1002,7 @@ static sqlite3_module vms_module = {
     vms_vtab_eof,
     vms_vtab_column,
     vms_vtab_rowid,
+    vms_vtab_update, /* xUpdate (R10; gated by mode=rw + stable key) */
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
@@ -782,3 +1045,5 @@ int vms_vtab_register(sqlite3* db, VmsVtabEnv* env, char** pzErrMsg)
     rc = sqlite3_create_module(db, "virtualmssql", &vms_module, NULL);
     return rc;
 }
+
+
