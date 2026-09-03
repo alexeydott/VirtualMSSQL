@@ -1,8 +1,6 @@
-# VirtualMSSQL research package
+# VirtualMSSQL
 
-Пакет содержит результаты архитектурного исследования для проекта **VirtualMSSQL** — SQLite loadable extension для доступа к Microsoft SQL Server через **Microsoft ODBC Driver 18 for SQL Server**.
-
-Состав:
+**VirtualMSSQL** — SQLite loadable extension для доступа к Microsoft SQL Server через **Microsoft ODBC Driver 18 for SQL Server**. Реализация закрывает этапы R0–R13 роадмапа (гейты G0–G13 PASS); исходные исследовательские документы проекта:
 
 - `01_TZ_VirtualMSSQL.md` — техническое задание версии 1.0: назначение, архитектура, обязательные требования, ограничения, контракты корректности и критерии приёмки.
 - `02_ROADMAP_VirtualMSSQL.md` — единая release-critical карта R0–R18: этап → обязательные работы → gate.
