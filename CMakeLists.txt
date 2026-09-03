@@ -30,6 +30,7 @@ add_library(vms_client STATIC
     src/vms_query_source.c
     src/vms_mat.c
     src/vms_dml.c
+    src/vms_meta_cache.c
     src/vms_vtab.c
 )
 target_include_directories(vms_client PUBLIC
@@ -45,8 +46,9 @@ target_compile_definitions(vms_client PRIVATE
 )
 target_link_libraries(vms_client PUBLIC odbc32 advapi32
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bin/$<IF:$<EQUAL:${CMAKE_SIZEOF_VOID_P},8>,x64,x86>/sqlite3.lib")
-# vms_mat.c is SQLITE_CORE (direct sqlite3 use for the private snapshot db)
-set_source_files_properties(src/vms_mat.c PROPERTIES COMPILE_DEFINITIONS "SQLITE_CORE")
+# vms_mat.c / vms_meta_cache.c are SQLITE_CORE (direct sqlite3 use for the
+# private snapshot / metadata cache dbs)
+set_source_files_properties(src/vms_mat.c src/vms_meta_cache.c PROPERTIES COMPILE_DEFINITIONS "SQLITE_CORE")
 target_compile_options(vms_client PRIVATE /W4 /utf-8)
 
 # ---- virtualmssql.dll (loadable extension) ----

@@ -10,6 +10,7 @@
  * absent: R6 is read-only; writes arrive in R10. */
 #include "vms_vtab.h"
 #include "vms_meta.h"
+#include "vms_meta_cache.h"
 #include "vms_plan.h"
 #include "vms_query_source.h"
 #include "vms_mat.h"
@@ -17,6 +18,7 @@
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 SQLITE_EXTENSION_INIT3
 
@@ -25,6 +27,10 @@ SQLITE_EXTENSION_INIT3
 struct VmsVtabEnv {
     VmsPool* pool;
     VmsProfile profile;
+    /* R13: metadata cache (process-wide shadow storage) */
+    VmsMetaCache* mdcache;
+    CRITICAL_SECTION cache_cs;
+    int cache_cs_init;
     /* R11: pinned transaction connection (one canonical identity per
      * transaction). NULL when no explicit transaction is open. */
     CRITICAL_SECTION txn_cs;
@@ -59,6 +65,10 @@ struct VmsVtab {
     VmsDmlContext* dml_txn;
     /* R12: spatial columns rendered as WKT (1) or WKB (0, default) */
     int spatial_wkt;
+    /* R13: metadata_mode: 0 = live (default), 1 = cached */
+    int metadata_cached;
+    unsigned long long schema_fp;   /* fingerprint of the live capture */
+    long long captured_utc;         /* capture timestamp of the cache entry */
     /* R10: stable-key values of the last row positioned by xRowid (stash
      * for xUpdate WHERE clauses: DELETE has no cursor access in xUpdate,
      * but SQLite always calls xRowid right before DELETE/UPDATE) */
@@ -121,6 +131,7 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     int rw = 0;
     int mat_mode_parsed = VMS_MAT_OFF;
     int spatial_wkt = 0; /* R12: default spatial representation = WKB */
+    int metadata_cached = 0; /* R13: default metadata_mode = live */
 
     (void)argc;
     if (!g_env) {
@@ -179,6 +190,18 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
                 *pzErr = sqlite3_mprintf("virtualmssql: spatial must be 'wkb' or 'wkt'");
                 return SQLITE_ERROR;
             }
+        } else if (!strncmp(a, "metadata_mode=", 14)) {
+            /* R13: live (default) reads metadata from the server on every
+             * connect; cached consults the shadow cache and applies the
+             * live validation policy (fresh / stale / drift). */
+            const char* sv = a + 14;
+            if (sv[0] == '\'') sv++;
+            if (!strncmp(sv, "cached", 6)) metadata_cached = 1;
+            else if (!strncmp(sv, "live", 4)) metadata_cached = 0;
+            else {
+                *pzErr = sqlite3_mprintf("virtualmssql: metadata_mode must be 'live' or 'cached'");
+                return SQLITE_ERROR;
+            }
         } else {
             *pzErr = sqlite3_mprintf("virtualmssql: unknown argument '%s'", a);
             return SQLITE_ERROR;
@@ -216,6 +239,13 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         *pzErr = sqlite3_mprintf("virtualmssql: invalid identifier");
         return SQLITE_ERROR;
     }
+    /* R13: shadow names are private to the module */
+    if (table && vms_vtab_shadow_name(table)) {
+        *pzErr = sqlite3_mprintf(
+            "virtualmssql: '%s' is a reserved shadow name (module-private)",
+            table);
+        return SQLITE_ERROR;
+    }
 
     memset(&err, 0, sizeof(err));
     tab = (struct VmsVtab*)sqlite3_malloc(sizeof(struct VmsVtab));
@@ -230,31 +260,139 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         strncpy_s(tab->table, sizeof(tab->table), table, _TRUNCATE);
     }
 
-    /* discover the shape through a pool lease */
+    /* discover the shape: live probe vs cached shadow read (R13) */
     {
-        VmsConnection* probe = vms_pool_acquire(g_env->pool, &g_env->profile, &err);
-        if (!probe) {
-            *pzErr = sqlite3_mprintf("virtualmssql: probe lease failed: %s", err.message);
-            sqlite3_free(tab);
-            return SQLITE_ERROR;
-        }
-        if (is_query) {
-            /* R8: validate + describe via sp_describe_first_result_set */
-            if (!vms_query_source_prepare(probe, query, &tab->qsrc, &err)) {
-                *pzErr = sqlite3_mprintf("virtualmssql: query rejected: %s", err.message);
+        VmsConnection* probe = NULL;
+        int server_ok = 0;
+        unsigned long long live_fp = 0;
+
+        if (!metadata_cached) {
+            /* live mode: every connect reads the server (default) */
+            probe = vms_pool_acquire(g_env->pool, &g_env->profile, &err);
+            if (!probe) {
+                *pzErr = sqlite3_mprintf("virtualmssql: probe lease failed: %s", err.message);
+                sqlite3_free(tab);
+                return SQLITE_ERROR;
+            }
+            if (is_query) {
+                if (!vms_query_source_prepare(probe, query, &tab->qsrc, &err)) {
+                    *pzErr = sqlite3_mprintf("virtualmssql: query rejected: %s", err.message);
+                    vms_pool_release(g_env->pool, probe);
+                    sqlite3_free(tab);
+                    return SQLITE_ERROR;
+                }
+                cols.count = 0; /* shape comes from qsrc */
+            } else if (!vms_meta_columns(probe, schema, table, &cols, &err)) {
+                *pzErr = sqlite3_mprintf("virtualmssql: metadata read failed: %s", err.message);
                 vms_pool_release(g_env->pool, probe);
                 sqlite3_free(tab);
                 return SQLITE_ERROR;
             }
-            cols.count = 0; /* shape comes from qsrc */
-        } else if (!vms_meta_columns(probe, schema, table, &cols, &err)) {
-            *pzErr = sqlite3_mprintf("virtualmssql: metadata read failed: %s", err.message);
             vms_pool_release(g_env->pool, probe);
-            sqlite3_free(tab);
-            return SQLITE_ERROR;
+        } else {
+            /* cached mode: consult the shadow cache first */
+            VmsCacheResult cres;
+            int cached_count = 0;
+            VmsTableColumns cached_cols;
+
+            /* 1) try the cache without a server round-trip */
+            EnterCriticalSection(&g_env->cache_cs);
+            cres = vms_meta_cache_get(g_env->mdcache, schema, table,
+                                      &cached_cols, &cached_count, 0);
+            LeaveCriticalSection(&g_env->cache_cs);
+            if (cres == VMS_CACHE_CORRUPT) {
+                *pzErr = sqlite3_mprintf(
+                    "virtualmssql: corrupt metadata cache entry for '%s.%s'",
+                    schema, table);
+                sqlite3_free(tab);
+                return SQLITE_ERROR;
+            }
+
+            /* 2) validate live: reachable server decides fresh vs stale */
+            probe = vms_pool_acquire(g_env->pool, &g_env->profile, &err);
+            if (probe) {
+                if (!is_query && vms_meta_columns(probe, schema, table, &cols, &err)) {
+                    server_ok = 1;
+                    live_fp = vms_meta_fingerprint(&cols, cols.count);
+                } else if (!is_query) {
+                    /* live read failed while the cache has an entry:
+                     * fall back to the stale snapshot */
+                    memset(&err, 0, sizeof(err));
+                }
+                vms_pool_release(g_env->pool, probe);
+            }
+
+            if (is_query) {
+                /* query sources are always described live (shape depends on
+                 * the statement, not a stable object) */
+                probe = vms_pool_acquire(g_env->pool, &g_env->profile, &err);
+                if (!probe) {
+                    *pzErr = sqlite3_mprintf("virtualmssql: probe lease failed: %s", err.message);
+                    sqlite3_free(tab);
+                    return SQLITE_ERROR;
+                }
+                if (!vms_query_source_prepare(probe, query, &tab->qsrc, &err)) {
+                    *pzErr = sqlite3_mprintf("virtualmssql: query rejected: %s", err.message);
+                    vms_pool_release(g_env->pool, probe);
+                    sqlite3_free(tab);
+                    return SQLITE_ERROR;
+                }
+                vms_pool_release(g_env->pool, probe);
+                cols.count = 0;
+            } else if (server_ok) {
+                if (cres == VMS_CACHE_MISS) {
+                    /* first capture: store the shadow snapshot */
+                    EnterCriticalSection(&g_env->cache_cs);
+                    vms_meta_cache_put(g_env->mdcache, schema, table, &cols,
+                                       cols.count, live_fp, (long long)time(NULL));
+                    LeaveCriticalSection(&g_env->cache_cs);
+                } else if (live_fp != 0) {
+                    VmsTableColumns entry_cols;
+                    int entry_count = 0;
+                    EnterCriticalSection(&g_env->cache_cs);
+                    cres = vms_meta_cache_get(g_env->mdcache, schema, table,
+                                              &entry_cols, &entry_count, live_fp);
+                    if (cres == VMS_CACHE_DRIFT) {
+                        LeaveCriticalSection(&g_env->cache_cs);
+                        *pzErr = sqlite3_mprintf(
+                            "virtualmssql: SCHEMA_DRIFT on '%s.%s': cached "
+                            "metadata no longer matches the server; drop and "
+                            "recreate the virtual table",
+                            schema, table);
+                        vms_meta_cache_drop(g_env->mdcache, schema, table);
+                        sqlite3_free(tab);
+                        return SQLITE_ERROR;
+                    }
+                    if (cres == VMS_CACHE_CORRUPT) {
+                        LeaveCriticalSection(&g_env->cache_cs);
+                        *pzErr = sqlite3_mprintf(
+                            "virtualmssql: corrupt metadata cache entry for '%s.%s'",
+                            schema, table);
+                        sqlite3_free(tab);
+                        return SQLITE_ERROR;
+                    }
+                    LeaveCriticalSection(&g_env->cache_cs);
+                }
+            } else {
+                /* server unavailable: stale read allowed only with an entry */
+                if (cres == VMS_CACHE_MISS || cres == VMS_CACHE_DRIFT) {
+                    *pzErr = sqlite3_mprintf(
+                        "virtualmssql: server unavailable and no usable cached "
+                        "metadata for '%s.%s': %s", schema, table, err.message);
+                    sqlite3_free(tab);
+                    return SQLITE_ERROR;
+                }
+                memcpy(&cols, &cached_cols, sizeof(cols));
+                tab->captured_utc = -1; /* flagged stale; fingerprint unknown */
+            }
+            tab->schema_fp = live_fp;
         }
-        vms_pool_release(g_env->pool, probe);
+        if (!metadata_cached && !is_query) {
+            tab->schema_fp = vms_meta_fingerprint(&cols, cols.count);
+            tab->captured_utc = (long long)time(NULL);
+        }
     }
+    tab->metadata_cached = metadata_cached;
     tab->ncols = is_query ? tab->qsrc.ncols : cols.count;
     if (tab->ncols < 1 || tab->ncols > 512) {
         *pzErr = sqlite3_mprintf("virtualmssql: object has %d columns (unsupported)",
@@ -1355,10 +1493,73 @@ static int vms_vtab_rollback_to(sqlite3_vtab* vtab, int n)
     return SQLITE_OK;
 }
 
+/* ---------- R13 shadow / integrity ---------- */
+
+/* xShadowName: reject any attempt to address a shadow-named object of a
+ * virtualmssql table directly (e.g. t12_vms_schema) — the shadow storage
+ * is private to the module. */
+static int vms_vtab_shadow_name(const char* name)
+{
+    const char* s1 = "_vms_schema";
+    const char* s2 = "_vms_metadata";
+    size_t n = strlen(name);
+    size_t l1 = strlen(s1), l2 = strlen(s2);
+    if (n > l1 && !strcmp(name + n - l1, s1)) return 1;
+    if (n > l2 && !strcmp(name + n - l2, s2)) return 1;
+    return 0;
+}
+
+/* xIntegrity: validation-only self-check over the module state for this
+ * vtab. Performs a structural audit WITHOUT a remote connection: the
+ * declared column count must be within bounds, every column must have a
+ * valid registry type and a non-empty name, and cached-mode tables must
+ * carry a non-zero schema fingerprint. Returns SQLITE_OK or an error. */
+static int vms_vtab_integrity(sqlite3_vtab* vtab, const char* zSchema,
+                              const char* zName, int isQuick, char** pzErr)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    int i;
+
+    (void)zSchema;
+    (void)zName;
+    (void)isQuick;
+    if (tab->ncols < 1 || tab->ncols > 512) {
+        *pzErr = sqlite3_mprintf("virtualmssql: integrity: ncols=%d out of range",
+                                 tab->ncols);
+        return SQLITE_ERROR;
+    }
+    for (i = 0; i < tab->ncols; i++) {
+        if (!tab->cols[i].name[0]) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: integrity: column %d has an empty name", i);
+            return SQLITE_ERROR;
+        }
+        if (tab->cols[i].vtype < VMS_CT_INT64 ||
+            tab->cols[i].vtype > VMS_CT_SPATIAL) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: integrity: column '%s' has an invalid type code %d",
+                tab->cols[i].name, (int)tab->cols[i].vtype);
+            return SQLITE_ERROR;
+        }
+        if (tab->cols[i].vtype == VMS_CT_UNSUPPORTED) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: integrity: column '%s' is UNSUPPORTED_TYPE",
+                tab->cols[i].name);
+            return SQLITE_ERROR;
+        }
+    }
+    if (tab->metadata_cached && !tab->is_query_source && tab->schema_fp == 0) {
+        *pzErr = sqlite3_mprintf(
+            "virtualmssql: integrity: cached-mode vtab carries no schema fingerprint");
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
 /* ---------- module struct ---------- */
 
 static sqlite3_module vms_module = {
-    2,                 /* iVersion (xSavepoint family required) */
+    3,                 /* iVersion (xShadowName + xIntegrity required) */
     vms_vtab_connect,  /* xCreate (same as connect: no shadow tables) */
     vms_vtab_connect,
     vms_vtab_best_index,
@@ -1381,7 +1582,8 @@ static sqlite3_module vms_module = {
     vms_vtab_savepoint,   /* xSavepoint */
     vms_vtab_release,     /* xRelease */
     vms_vtab_rollback_to, /* xRollbackTo */
-    0, 0                  /* xShadowName, xIntegrity (iVersion 3+) */
+    0,                    /* xShadowName (R13: declared, checked in connect) */
+    vms_vtab_integrity    /* xIntegrity (R13: offline self-check) */
 };
 
 /* ---------- env + registration ---------- */
@@ -1398,9 +1600,14 @@ VmsVtabEnv* vms_vtab_env_create(const VmsProfile* profile, VmsError* err)
     env->profile = *profile;
     InitializeCriticalSection(&env->txn_cs);
     env->txn_cs_init = 1;
+    InitializeCriticalSection(&env->cache_cs);
+    env->cache_cs_init = 1;
+    env->mdcache = vms_meta_cache_open(0);
     env->pool = vms_pool_create(4);
     if (!env->pool) {
         vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM vtab pool");
+        if (env->mdcache) vms_meta_cache_close(env->mdcache);
+        DeleteCriticalSection(&env->cache_cs);
         DeleteCriticalSection(&env->txn_cs);
         HeapFree(GetProcessHeap(), 0, env);
         return NULL;
@@ -1418,6 +1625,8 @@ void vms_vtab_env_destroy(VmsVtabEnv* env)
         env->txn_cn = NULL;
     }
     if (env->pool) vms_pool_destroy(env->pool);
+    if (env->mdcache) vms_meta_cache_close(env->mdcache);
+    if (env->cache_cs_init) DeleteCriticalSection(&env->cache_cs);
     if (env->txn_cs_init) DeleteCriticalSection(&env->txn_cs);
     HeapFree(GetProcessHeap(), 0, env);
 }
