@@ -207,6 +207,15 @@ add_dependencies(test_r14 virtualmssql)
 add_test(NAME r14
     COMMAND test_r14 $<TARGET_FILE:virtualmssql>)
 
+# ---- R15 performance qualification (manual benchmark; not a ctest) ----
+add_executable(bench_r15 bench_r15.c)
+target_include_directories(bench_r15 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_link_libraries(bench_r15 PRIVATE vms_test_harness vms_client psapi)
+target_compile_options(bench_r15 PRIVATE /utf-8)
+
 # seed helper (not a test): creates R6 fixtures on the live server
 add_executable(seed_r6 seed_r6.c)
 target_link_libraries(seed_r6 PRIVATE vms_client)

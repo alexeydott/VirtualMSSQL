@@ -125,6 +125,22 @@ int main(void)
         L"CREATE TABLE dbo.vms6_t_empty(id int NOT NULL PRIMARY KEY)",
         L"CREATE TABLE dbo.vms6_t_big(id int NOT NULL PRIMARY KEY, i bigint NOT NULL)",
         L"CREATE VIEW dbo.vms6_view AS SELECT id, v FROM dbo.vms6_t_int",
+        /* R15 performance fixtures */
+        L"IF OBJECT_ID(N'dbo.vms15_wide') IS NOT NULL DROP TABLE dbo.vms15_wide;"
+        L"IF OBJECT_ID(N'dbo.vms15_lob') IS NOT NULL DROP TABLE dbo.vms15_lob",
+        L"CREATE TABLE dbo.vms15_wide("
+        L" id int NOT NULL PRIMARY KEY,"
+        L" c1 nvarchar(80), c2 nvarchar(80), c3 nvarchar(80), c4 nvarchar(80),"
+        L" c5 nvarchar(80), c6 nvarchar(80), c7 nvarchar(80), c8 nvarchar(80),"
+        L" n1 int, n2 int, n3 int, n4 int, f1 float, f2 float, g1 uniqueidentifier)",
+        L"INSERT INTO dbo.vms15_wide"
+        L" (id, c1, c2, c3, c4, c5, c6, c7, c8, n1, n2, n3, n4, f1, f2, g1)"
+        L" SELECT TOP (5000)"
+        L" ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),"
+        L" REPLICATE(N'w', 80), REPLICATE(N'x', 80), REPLICATE(N'y', 80), REPLICATE(N'z', 80),"
+        L" REPLICATE(N'a', 80), REPLICATE(N'b', 80), REPLICATE(N'c', 80), REPLICATE(N'd', 80),"
+        L" 1, 2, 3, 4, 0.5, 1.5, NEWID()"
+        L" FROM sys.all_objects a CROSS JOIN sys.all_objects b",
         NULL
     };
     wchar_t bigins[2200];
@@ -133,8 +149,17 @@ int main(void)
     (void)bigins;
     if (!spec) { fprintf(stderr, "VMS_TEST_PROFILE not set\n"); return 1; }
     vms_cred_set_provider(vms_cred_memory_provider());
-    vms_cred_memory_set(L"test:uid", L"sa");
-    vms_cred_memory_set(L"test:pwd", L"Vms-Probe-2026!x");
+    /* credentials: defaults match the localhost test server; override with
+     * VMS_BENCH_UID / VMS_BENCH_PWD for remote seed targets */
+    {
+        const char* uid = getenv("VMS_BENCH_UID");
+        const char* pwd = getenv("VMS_BENCH_PWD");
+        wchar_t wuid[128], wpwd[256];
+        MultiByteToWideChar(CP_UTF8, 0, uid ? uid : "sa", -1, wuid, 128);
+        MultiByteToWideChar(CP_UTF8, 0, pwd ? pwd : "Vms-Probe-2026!x", -1, wpwd, 256);
+        vms_cred_memory_set(L"test:uid", wuid);
+        vms_cred_memory_set(L"test:pwd", wpwd);
+    }
     if (!vms_profile_parse(spec, &profile, &err)) {
         fprintf(stderr, "profile: %s\n", err.message);
         return 1;
@@ -159,6 +184,21 @@ int main(void)
             L"ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),"
             L" ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) "
             L"FROM sys.all_objects a CROSS JOIN sys.all_objects b",
+            /* R15: 1M-row narrow table (vms15_million; idempotent reseed) */
+            L"IF OBJECT_ID(N'dbo.vms15_million') IS NOT NULL DROP TABLE dbo.vms15_million",
+            L"CREATE TABLE dbo.vms15_million(id bigint NOT NULL PRIMARY KEY, i bigint NOT NULL)",
+            L"INSERT INTO dbo.vms15_million(id, i) SELECT TOP (1000000)"
+            L" ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),"
+            L" ROW_NUMBER() OVER (ORDER BY (SELECT NULL))"
+            L" FROM sys.all_objects a CROSS JOIN sys.all_objects b"
+            L" CROSS JOIN sys.all_objects c",
+            /* R15: LOB table with 1MB/16MB/64MB rows */
+            L"IF OBJECT_ID(N'dbo.vms15_lob') IS NOT NULL DROP TABLE dbo.vms15_lob",
+            L"CREATE TABLE dbo.vms15_lob(id int NOT NULL PRIMARY KEY, sz int NOT NULL, bigt nvarchar(max) NULL, bigb varbinary(max) NULL)",
+            L"INSERT INTO dbo.vms15_lob(id, sz, bigt) VALUES"
+            L" (1, 1, REPLICATE(CAST(N'A' AS nvarchar(max)), 512*1024)),"
+            L" (2, 16, REPLICATE(CAST(N'B' AS nvarchar(max)), 8*1024*1024)),"
+            L" (3, 64, REPLICATE(CAST(N'C' AS nvarchar(max)), 32*1024*1024))",
             NULL
         };
         for (i = 0; extra[i]; i++) {
