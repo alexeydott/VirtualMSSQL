@@ -26,3 +26,5 @@ out/
 # probe leftovers
 probe-*.json
 probe-*.log
+
+wkt.txt
