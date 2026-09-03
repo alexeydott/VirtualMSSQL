@@ -20,10 +20,23 @@
 
 SQLITE_EXTENSION_INIT3
 
+#define VMS_TXN_MAX_SAVEPOINTS 32
+
 struct VmsVtabEnv {
     VmsPool* pool;
     VmsProfile profile;
+    /* R11: pinned transaction connection (one canonical identity per
+     * transaction). NULL when no explicit transaction is open. */
+    CRITICAL_SECTION txn_cs;
+    int txn_cs_init;
+    VmsConnection* txn_cn;
+    int txn_pinned;                  /* pinned + primer applied */
+    /* savepoint bookkeeping (SQLite per-transaction savepoint ids) */
+    char sv_names[VMS_TXN_MAX_SAVEPOINTS][48];
+    int sv_count;
 };
+
+#define VMS_TXN_MAX_SAVEPOINTS 32
 
 struct VmsVtab {
     sqlite3_vtab base;
@@ -42,6 +55,8 @@ struct VmsVtab {
     /* R10: write mode (table sources only) */
     int rw_mode;
     VmsDmlContext* dml;    /* prepared lazily; requires a stable key */
+    /* R11: DML context bound to the pinned transaction connection */
+    VmsDmlContext* dml_txn;
     /* R10: stable-key values of the last row positioned by xRowid (stash
      * for xUpdate WHERE clauses: DELETE has no cursor access in xUpdate,
      * but SQLite always calls xRowid right before DELETE/UPDATE) */
@@ -68,6 +83,10 @@ struct VmsVtabCursor {
 };
 
 static VmsVtabEnv* g_env = NULL; /* single-module env for R6 */
+
+/* R11 forward decls (used by xFilter / best_index before their definitions) */
+static VmsConnection* txn_current(VmsVtabEnv* env);
+static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err);
 
 /* ---------- module helpers ---------- */
 
@@ -307,6 +326,10 @@ static int vms_vtab_disconnect(sqlite3_vtab* vtab)
         if (tab->dml->cn) vms_conn_close(tab->dml->cn);
         HeapFree(GetProcessHeap(), 0, tab->dml);
     }
+    if (tab->dml_txn) {
+        /* the transaction connection is owned by the env pin */
+        HeapFree(GetProcessHeap(), 0, tab->dml_txn);
+    }
     if (tab->cols) sqlite3_free(tab->cols);
     sqlite3_free(tab);
     return SQLITE_OK;
@@ -369,8 +392,6 @@ static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
 }
 
 /* ---------- xOpen / xClose / xFilter / xNext / xEof / xColumn / xRowid --- */
-
-static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err);
 
 static int vms_vtab_open(sqlite3_vtab* vtab, sqlite3_vtab_cursor** ppCursor)
 {
@@ -614,10 +635,24 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         } else if (plan.has_limit && plan.norder > 0) {
             sqlparams[sp++] = plan_limit;    /* FETCH NEXT ? */
         }
-        cur->cur = vms_cursor_open_sql(lease, sql, sqlparams, sp, &err);
+        {
+            VmsConnection* txn_cn = txn_current(tab->env);
+            if (txn_cn) {
+                /* R11: inside a transaction reads join the pinned
+                 * identity (see own uncommitted writes; MARS) */
+                cur->cur = vms_cursor_open_shared(txn_cn, sql, sqlparams, sp, &err);
+            } else {
+                cur->cur = vms_cursor_open_sql(lease, sql, sqlparams, sp, &err);
+            }
+        }
     } else {
-        cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
-                                   tab->cols, tab->ncols, &err);
+        VmsConnection* txn_cn = txn_current(tab->env);
+        if (txn_cn) {
+            cur->cur = vms_cursor_open_shared(txn_cn, sql, NULL, 0, &err);
+        } else {
+            cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
+                                       tab->cols, tab->ncols, &err);
+        }
     }
     /* the cursor owns its own HDBC; the pool lease connection itself is
      * returned to the pool right away (it only served as the profile
@@ -786,7 +821,11 @@ static int vms_vtab_rowid(sqlite3_vtab_cursor* cursor, sqlite3_int64* pRowid)
         VmsDmlContext* d;
         VmsError derr;
         memset(&derr, 0, sizeof(derr));
-        if (vtab_dml_ctx(tab, &d, &derr)) {
+        /* only reuse an existing DML context: creating one here would run
+         * catalog queries on the scan connection while it is busy streaming
+         * this very result set (driver error HY000 "connection busy") */
+        if (tab->dml || tab->dml_txn) {
+            d = tab->dml ? tab->dml : tab->dml_txn;
             int k;
             tab->key_have = 1;
             for (k = 0; k < d->key.part_count; k++) {
@@ -875,12 +914,44 @@ static const char* upd_key_stash_get(void* user, int col, int* is_null)
     return NULL;
 }
 
-/* lazily prepare the DML context (validates the stable key once). The
- * context owns a dedicated connection (acquired from the env pool once and
- * kept for the vtab's lifetime) used for all writes. */
+/* lazily prepare the DML context (validates the stable key once). In an
+ * explicit transaction the write goes through the pinned connection (all
+ * statements join one remote transaction); otherwise it owns a dedicated
+ * connection kept for the vtab's lifetime (autocommit writes). */
 static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err)
 {
     VmsConnection* lease;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* txn_cn;
+
+    /* R11: inside an explicit transaction route writes through the pin */
+    EnterCriticalSection(&env->txn_cs);
+    txn_cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    if (txn_cn) {
+        if (tab->dml_txn && tab->dml_txn->cn == txn_cn) {
+            *out = tab->dml_txn;
+            return 1;
+        }
+        if (tab->dml_txn) HeapFree(GetProcessHeap(), 0, tab->dml_txn);
+        tab->dml_txn = (VmsDmlContext*)HeapAlloc(GetProcessHeap(),
+                                                 HEAP_ZERO_MEMORY,
+                                                 sizeof(VmsDmlContext));
+        if (!tab->dml_txn) {
+            vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM dml ctx");
+            return 0;
+        }
+        if (!vms_dml_init(tab->dml_txn, txn_cn, tab->schema, tab->table,
+                          tab->cols, tab->ncols, err)) {
+            HeapFree(GetProcessHeap(), 0, tab->dml_txn);
+            tab->dml_txn = NULL;
+            return 0;
+        }
+        /* also require the lazy BEGIN before the first DML in the txn */
+        if (vms_txn_begin_lazy(txn_cn, err) != 0) return 0;
+        *out = tab->dml_txn;
+        return 1;
+    }
 
     if (tab->dml) { *out = tab->dml; return 1; }
     if (!tab->rw_mode) return 0;
@@ -986,10 +1057,277 @@ static int vms_vtab_update(sqlite3_vtab* vtab, int argc, sqlite3_value** argv,
     return SQLITE_OK;
 }
 
+/* ---------- R11 transactions ---------- */
+
+/* current pinned transaction connection (or NULL); no locking side effects */
+static VmsConnection* txn_current(VmsVtabEnv* env)
+{
+    VmsConnection* cn;
+    EnterCriticalSection(&env->txn_cs);
+    cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    return cn;
+}
+
+/* acquire (or return) the pinned transaction connection. The pin holds one
+ * pool connection for the transaction's lifetime; the lazy BEGIN happens
+ * on the first write, not here (xBegin precedes possibly read-only work).
+ * The connection is opened with MARS enabled so that read cursors on the
+ * same identity can stream concurrently with the writes (one canonical
+ * SQL Server identity sees its own uncommitted data). */
+static VmsConnection* txn_pin_shared(struct VmsVtab* tab, VmsError* err)
+{
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+
+    EnterCriticalSection(&env->txn_cs);
+    if (env->txn_cn) {
+        LeaveCriticalSection(&env->txn_cs);
+        return env->txn_cn;
+    }
+    LeaveCriticalSection(&env->txn_cs);
+
+    {
+        /* the txn connection uses the standard profile connstr: MARS must
+         * stay OFF because a MARS transaction is bound to its batch —
+         * statements from different batches would not share one
+         * transaction (server error 6401 on savepoint use). All access is
+         * serialized by the connection's worker thread instead. */
+        VmsProfile txn_profile = env->profile;
+        wchar_t* connstr = NULL;
+        size_t connstr_len = 0;
+        VmsError verr;
+        txn_profile.mars = 0;
+        if (!vms_connstr_build(&txn_profile, &connstr, &connstr_len, &verr)) {
+            *err = verr;
+            return NULL;
+        }
+        cn = vms_conn_open(vms_pool_client(env->pool), connstr, &verr);
+        vms_connstr_free(connstr);
+        if (!cn) {
+            *err = verr;
+            return NULL;
+        }
+    }
+    if (vms_txn_pin(cn, err) != 0) {
+        vms_conn_close(cn);
+        return NULL;
+    }
+    EnterCriticalSection(&env->txn_cs);
+    if (env->txn_cn) {
+        /* raced with another pin: drop the extra connection */
+        LeaveCriticalSection(&env->txn_cs);
+        vms_txn_rollback(cn, err);
+        vms_conn_close(cn);
+        EnterCriticalSection(&env->txn_cs);
+        cn = env->txn_cn;
+        LeaveCriticalSection(&env->txn_cs);
+        return cn;
+    }
+    env->txn_cn = cn;
+    env->txn_pinned = 1;
+    LeaveCriticalSection(&env->txn_cs);
+    return cn;
+}
+
+/* unpin and close the transaction connection (never returned to the pool:
+ * it has a dedicated MARS connstr and may carry session state) */
+static void txn_unpin(struct VmsVtab* tab)
+{
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn = NULL;
+    EnterCriticalSection(&env->txn_cs);
+    if (env->txn_cn) {
+        cn = env->txn_cn;
+        env->txn_cn = NULL;
+        env->txn_pinned = 0;
+        env->sv_count = 0;
+    }
+    LeaveCriticalSection(&env->txn_cs);
+    if (cn) vms_conn_close(cn);
+}
+
+static int vms_vtab_begin(sqlite3_vtab* vtab)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsError err;
+    memset(&err, 0, sizeof(err));
+    if (!txn_pin_shared(tab, &err)) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
+/* xSync: validation-only (R11). The remote transaction must exist and not
+ * be doomed; no data is flushed here. */
+static int vms_vtab_sync(sqlite3_vtab* vtab)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+
+    EnterCriticalSection(&env->txn_cs);
+    cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    if (!cn) return SQLITE_OK; /* no transaction: nothing to validate */
+
+    if (!vms_txn_validate(cn)) {
+        if (vms_txn_doomed(cn)) {
+            vtab->zErrMsg = sqlite3_mprintf(
+                "virtualmssql: transaction is uncommittable (XACT_STATE()=-1); "
+                "rollback required");
+            return SQLITE_ERROR;
+        }
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: transaction lost on the remote connection");
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
+/* xCommit: non-cancellable finalization */
+static int vms_vtab_commit(sqlite3_vtab* vtab)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+    VmsTxnResult res;
+    VmsError err;
+    memset(&err, 0, sizeof(err));
+
+    EnterCriticalSection(&env->txn_cs);
+    cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    if (!cn) return SQLITE_OK; /* nothing joined the transaction */
+
+    res = vms_txn_commit(cn, &err);
+    if (res == VMS_TXN_OK) {
+        txn_unpin(tab);
+        return SQLITE_OK;
+    }
+    if (res == VMS_TXN_BUSY) {
+        txn_unpin(tab);
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: commit timed out against a conflicting operation");
+        return SQLITE_BUSY;
+    }
+    /* VMS_TXN_UNKNOWN: outcome unknowable (quarantined connection) */
+    txn_unpin(tab);
+    vtab->zErrMsg = sqlite3_mprintf(
+        "virtualmssql: commit outcome unknown; the connection was "
+        "quarantined and the data state must be verified manually");
+    return SQLITE_ERROR;
+}
+
+/* xRollback: non-cancellable finalization (rollback has no unknown-outcome
+ * ambiguity: server either rolls back or the connection is dead) */
+static int vms_vtab_rollback(sqlite3_vtab* vtab)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+    VmsTxnResult res;
+    VmsError err;
+    memset(&err, 0, sizeof(err));
+
+    EnterCriticalSection(&env->txn_cs);
+    cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    if (!cn) return SQLITE_OK;
+
+    res = vms_txn_rollback(cn, &err);
+    txn_unpin(tab);
+    if (res == VMS_TXN_OK) return SQLITE_OK;
+    if (res == VMS_TXN_BUSY) {
+        vtab->zErrMsg = sqlite3_mprintf(
+            "virtualmssql: rollback timed out against a conflicting operation");
+        return SQLITE_BUSY;
+    }
+    vtab->zErrMsg = sqlite3_mprintf(
+        "virtualmssql: rollback failed; connection quarantined");
+    return SQLITE_ERROR;
+}
+
+/* savepoint names: vms_sv_<n> (validated identifier, never user input) */
+static int vms_vtab_savepoint(sqlite3_vtab* vtab, int n)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+    VmsError err;
+    char name[48];
+
+    memset(&err, 0, sizeof(err));
+    cn = txn_pin_shared(tab, &err);
+    if (!cn) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    /* savepoint before the first write implies the lazy BEGIN */
+    if (vms_txn_begin_lazy(cn, &err) != 0) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "vms_sv_%d", n);
+    if (vms_txn_savepoint(cn, name, 0, &err) != 0) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    EnterCriticalSection(&env->txn_cs);
+    if (env->sv_count < VMS_TXN_MAX_SAVEPOINTS) {
+        strncpy_s(env->sv_names[env->sv_count], sizeof(env->sv_names[0]),
+                  name, _TRUNCATE);
+        env->sv_count++;
+    }
+    LeaveCriticalSection(&env->txn_cs);
+    return SQLITE_OK;
+}
+
+static int vms_vtab_release(sqlite3_vtab* vtab, int n)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    /* local bookkeeping only: the remote SAVE stays valid for the remaining
+     * nesting level; SQLite guarantees release of the topmost savepoint */
+    EnterCriticalSection(&env->txn_cs);
+    if (env->sv_count > 0) env->sv_count--;
+    LeaveCriticalSection(&env->txn_cs);
+    return SQLITE_OK;
+}
+
+static int vms_vtab_rollback_to(sqlite3_vtab* vtab, int n)
+{
+    struct VmsVtab* tab = (struct VmsVtab*)vtab;
+    VmsVtabEnv* env = tab->env;
+    VmsConnection* cn;
+    VmsError err;
+    char name[48];
+    int keep;
+
+    memset(&err, 0, sizeof(err));
+    EnterCriticalSection(&env->txn_cs);
+    cn = env->txn_cn;
+    LeaveCriticalSection(&env->txn_cs);
+    if (!cn) return SQLITE_OK; /* nothing to roll back to */
+
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "vms_sv_%d", n);
+    if (vms_txn_savepoint(cn, name, 1, &err) != 0) {
+        vtab_set_error(vtab, &err);
+        return SQLITE_ERROR;
+    }
+    /* drop bookkeeping above the restored savepoint (n stays valid) */
+    EnterCriticalSection(&env->txn_cs);
+    keep = n + 1;
+    if (env->sv_count > keep) env->sv_count = keep;
+    LeaveCriticalSection(&env->txn_cs);
+    return SQLITE_OK;
+}
+
 /* ---------- module struct ---------- */
 
 static sqlite3_module vms_module = {
-    1,                 /* iVersion */
+    2,                 /* iVersion (xSavepoint family required) */
     vms_vtab_connect,  /* xCreate (same as connect: no shadow tables) */
     vms_vtab_connect,
     vms_vtab_best_index,
@@ -1003,7 +1341,16 @@ static sqlite3_module vms_module = {
     vms_vtab_column,
     vms_vtab_rowid,
     vms_vtab_update, /* xUpdate (R10; gated by mode=rw + stable key) */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    vms_vtab_begin,       /* xBegin */
+    vms_vtab_sync,        /* xSync (validation-only) */
+    vms_vtab_commit,      /* xCommit */
+    vms_vtab_rollback,    /* xRollback */
+    0,                    /* xFindFunction */
+    0,                    /* xRename */
+    vms_vtab_savepoint,   /* xSavepoint */
+    vms_vtab_release,     /* xRelease */
+    vms_vtab_rollback_to, /* xRollbackTo */
+    0, 0                  /* xShadowName, xIntegrity (iVersion 3+) */
 };
 
 /* ---------- env + registration ---------- */
@@ -1018,9 +1365,12 @@ VmsVtabEnv* vms_vtab_env_create(const VmsProfile* profile, VmsError* err)
         return NULL;
     }
     env->profile = *profile;
+    InitializeCriticalSection(&env->txn_cs);
+    env->txn_cs_init = 1;
     env->pool = vms_pool_create(4);
     if (!env->pool) {
         vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM vtab pool");
+        DeleteCriticalSection(&env->txn_cs);
         HeapFree(GetProcessHeap(), 0, env);
         return NULL;
     }
@@ -1030,7 +1380,14 @@ VmsVtabEnv* vms_vtab_env_create(const VmsProfile* profile, VmsError* err)
 void vms_vtab_env_destroy(VmsVtabEnv* env)
 {
     if (!env) return;
+    if (env->txn_cn) {
+        VmsError err;
+        memset(&err, 0, sizeof(err));
+        vms_txn_rollback(env->txn_cn, &err);
+        env->txn_cn = NULL;
+    }
     if (env->pool) vms_pool_destroy(env->pool);
+    if (env->txn_cs_init) DeleteCriticalSection(&env->txn_cs);
     HeapFree(GetProcessHeap(), 0, env);
 }
 

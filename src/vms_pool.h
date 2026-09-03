@@ -20,6 +20,9 @@ typedef struct VmsPool VmsPool;
 /* create a bounded pool. capacity must be >= 1. */
 VmsPool* vms_pool_create(int capacity);
 void vms_pool_destroy(VmsPool* pool);
+/* the pool's ODBC environment owner (for opening non-pooled connections
+ * like the R11 transaction pin) */
+VmsClient* vms_pool_client(VmsPool* pool);
 
 /* acquire: takes an idle verified connection or opens a new one.
  * The connstr comes from the strict builder (profile + provider). */

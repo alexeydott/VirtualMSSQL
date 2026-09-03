@@ -114,6 +114,8 @@ struct VmsConnection {
     HDBC hdbc;              /* single owner: this object */
     VmsWorker* worker;
     volatile LONG quarantined;
+    volatile LONG txn_active;   /* R11: remote transaction open */
+    volatile LONG txn_pinned;   /* R11: manual-commit mode + primer applied */
     wchar_t* last_connstr;  /* kept for cursor leases (R6) */
 };
 
@@ -129,10 +131,11 @@ struct VmsStatement {
 /* R6 read cursor: independent lease = its own HDBC + worker, so nested
  * SQLite scans stream in parallel over their own connections. */
 struct VmsCursor {
-    HDBC hdbc;              /* owned lease */
+    HDBC hdbc;              /* owned lease, or the parent's HDBC (shared) */
     VmsWorker* worker;
     HSTMT hstmt;            /* single owner: this object */
     volatile LONG closed;
+    int own_hdbc;           /* 1 = disconnect hdbc at close; 0 = shared */
     int col_count;
     VmsColumnMeta* meta;
     VmsValue* row;
@@ -1063,16 +1066,11 @@ static void job_dml(void* arg)
         HeapFree(GetProcessHeap(), 0, tval_holders);
     }
     op->rows = (long long)rows;
-    /* defensive: ensure the DML statement left no open implicit transaction
-     * (SQLNumResultCols/row-count edge cases with this driver); commit any
-     * pending work so autocommit semantics hold for the connection */
-    {
-        SQLHSTMT h2 = SQL_NULL_HSTMT;
-        if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &h2))) {
-            SQLExecDirectW(h2, (SQLWCHAR*)L"IF @@TRANCOUNT > 0 COMMIT TRAN", SQL_NTS);
-            SQLFreeHandle(SQL_HANDLE_STMT, h2);
-        }
-    }
+    /* NOTE (R11): the defensive auto-commit that used to live here
+     * ("IF @@TRANCOUNT > 0 COMMIT TRAN") is removed — inside an explicit
+     * transaction it silently committed the remote work after every DML,
+     * destroying savepoints. Transaction scope is owned exclusively by the
+     * R11 pin/lazy-BEGIN/finalize machinery. */
     op->ok = 1;
     return;
 
@@ -1154,6 +1152,316 @@ int vms_tran_rollback(VmsConnection* cn, VmsError* err)
     op.ok = 0;
     vms_worker_run(cn->worker, job_rollback, &op);
     return op.ok ? 0 : -1;
+}
+
+/* ================= R11 explicit transactions ================= */
+
+/* SQL_COPT_SS_AUTOBEGINTXN (msodbcsql.h): 1400 + 2 */
+#ifndef SQL_COPT_SS_AUTOBEGINTXN
+#define SQL_COPT_SS_AUTOBEGINTXN 1402
+#endif
+#ifndef SQL_AUTOBEGINTXN_OFF
+#define SQL_AUTOBEGINTXN_OFF 0UL
+#endif
+
+typedef struct OpTxn {
+    VmsConnection* cn;
+    const char* name;       /* savepoint name (validated identifier) */
+    int rollback_op;        /* savepoint: 0 = SAVE, 1 = ROLLBACK TO */
+    VmsTxnResult result;
+    VmsError* err;
+    int ok;
+} OpTxn;
+
+/* one-shot exec of a UTF-8 statement on the connection (worker context) */
+static SQLRETURN txn_exec_utf8(HDBC hdbc, const char* sql_utf8)
+{
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    SQLRETURN r;
+    wchar_t wsql[512];
+    int n = MultiByteToWideChar(CP_UTF8, 0, sql_utf8, -1, wsql, 512);
+    if (n <= 0) return SQL_ERROR;
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &st))) return SQL_ERROR;
+    r = SQLExecDirectW(st, wsql, SQL_NTS);
+    SQLFreeStmt(st, SQL_CLOSE);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    return r;
+}
+
+/* pin: manual-commit mode + AUTOBEGINTXN OFF + primer. Runs on the worker. */
+static void job_txn_pin(void* arg)
+{
+    OpTxn* op = (OpTxn*)arg;
+    SQLRETURN r;
+    vms_error_ok(op->err);
+    if (InterlockedCompareExchange(&op->cn->txn_pinned, 0, 0)) { op->ok = 1; return; }
+
+    /* manual-commit mode: SQLEndTran drives finalization */
+    r = SQLSetConnectAttr(op->cn->hdbc, SQL_ATTR_AUTOCOMMIT,
+                          (SQLPOINTER)SQL_AUTOCOMMIT_OFF, SQL_IS_INTEGER);
+    if (!SQL_SUCCEEDED(r)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_DBC, op->cn->hdbc, "txn pin: autocommit off", &q);
+        op->ok = 0;
+        return;
+    }
+    /* the driver must not auto-begin: BEGIN is issued explicitly (lazy) */
+    r = SQLSetConnectAttr(op->cn->hdbc, SQL_COPT_SS_AUTOBEGINTXN,
+                          (SQLPOINTER)SQL_AUTOBEGINTXN_OFF, SQL_IS_INTEGER);
+    if (!SQL_SUCCEEDED(r)) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_DBC, op->cn->hdbc, "txn pin: autobegin off", &q);
+        op->ok = 0;
+        return;
+    }
+    /* primer: XACT_ABORT ON makes runtime errors doom the transaction, so
+     * xSync can detect the doomed state via XACT_STATE(). */
+    if (!SQL_SUCCEEDED(txn_exec_utf8(op->cn->hdbc, "SET XACT_ABORT ON"))) {
+        int q;
+        diag_capture(op->err, SQL_HANDLE_DBC, op->cn->hdbc, "txn pin: primer", &q);
+        /* restore autocommit before giving the connection back */
+        SQLSetConnectAttr(op->cn->hdbc, SQL_ATTR_AUTOCOMMIT,
+                          (SQLPOINTER)SQL_AUTOCOMMIT_ON, SQL_IS_INTEGER);
+        op->ok = 0;
+        return;
+    }
+    InterlockedExchange(&op->cn->txn_pinned, 1);
+    op->ok = 1;
+}
+
+/* lazy BEGIN: explicitly open the server transaction when the first write
+ * (or savepoint) joins. Idempotent: skipped once the transaction is open.
+ * SQLEndTran(COMMIT) maps to one COMMIT TRANSACTION, which matches this
+ * exactly one BEGIN (TRANCOUNT 1 -> 0). */
+static void job_txn_begin_lazy(void* arg)
+{
+    OpTxn* op = (OpTxn*)arg;
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    SQLRETURN r;
+    SQLBIGINT tc = -1;
+    SQLLEN ind = 0;
+    SQLWCHAR q1[] = L"SELECT @@TRANCOUNT";
+    vms_error_ok(op->err);
+    if (InterlockedCompareExchange(&op->cn->txn_active, 0, 0)) { op->ok = 1; return; }
+    if (!InterlockedCompareExchange(&op->cn->txn_pinned, 0, 0)) {
+        vms_error_set(op->err, VMS_ERR_INVALID_ARG, NULL, 0,
+                      "lazy txn start: connection not pinned");
+        op->ok = 0;
+        return;
+    }
+    if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &st)) &&
+        SQL_SUCCEEDED(SQLExecDirectW(st, q1, SQL_NTS)) &&
+        SQL_SUCCEEDED(SQLFetch(st)) &&
+        SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_SBIGINT, &tc, 0, &ind))) {
+        SQLFreeStmt(st, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+        st = SQL_NULL_HSTMT;
+        if (tc > 0) {
+            /* driver-managed txn already open (autocommit=OFF implicit) */
+            InterlockedExchange(&op->cn->txn_active, 1);
+            op->ok = 1;
+            return;
+        }
+        if (SQL_SUCCEEDED(txn_exec_utf8(op->cn->hdbc, "BEGIN TRANSACTION"))) {
+            InterlockedExchange(&op->cn->txn_active, 1);
+            op->ok = 1;
+            return;
+        }
+    }
+    if (st != SQL_NULL_HSTMT) {
+        SQLFreeStmt(st, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+    }
+    op->ok = 0;
+    op->err->cls = VMS_ERR_EXEC;
+    _snprintf_s(op->err->message, sizeof(op->err->message), _TRUNCATE,
+                "lazy txn start failed");
+}
+
+/* savepoint statement: SAVE / ROLLBACK TRANSACTION <name> */
+static void job_txn_savepoint(void* arg)
+{
+    OpTxn* op = (OpTxn*)arg;
+    char sql[160];
+    vms_error_ok(op->err);
+    _snprintf_s(sql, sizeof(sql), _TRUNCATE, "%s TRANSACTION [%s]",
+                op->rollback_op ? "ROLLBACK" : "SAVE", op->name);
+    {
+        /* diag must be captured from the statement handle itself */
+        SQLHSTMT st = SQL_NULL_HSTMT;
+        SQLRETURN r;
+        wchar_t wsql[512];
+        MultiByteToWideChar(CP_UTF8, 0, sql, -1, wsql, 512);
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &st))) {
+            vms_error_set(op->err, VMS_ERR_INTERNAL, NULL, 0, "savepoint: alloc failed");
+            op->ok = 0;
+            return;
+        }
+        r = SQLExecDirectW(st, wsql, SQL_NTS);
+        if (!SQL_SUCCEEDED(r)) {
+            int q;
+            SQLWCHAR state[6]; SQLWCHAR msg[1024];
+            SQLINTEGER native = 0; SQLSMALLINT len = 0;
+            char st_u8[8] = {0}; char msg_u8[512] = {0};
+            SQLRETURN dr = SQLGetDiagRecW(SQL_HANDLE_STMT, st, 1, state, &native,
+                                          msg, 1024, &len);
+            (void)q;
+            if (SQL_SUCCEEDED(dr)) {
+                WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)state, -1, st_u8, sizeof(st_u8), NULL, NULL);
+                WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)msg, -1, msg_u8, sizeof(msg_u8), NULL, NULL);
+            }
+            vms_error_set(op->err, VMS_ERR_EXEC, st_u8, (int)native,
+                          "%s: %s", sql, msg_u8[0] ? msg_u8 : "no diagnostics");
+            SQLFreeHandle(SQL_HANDLE_STMT, st);
+            op->ok = 0;
+            return;
+        }
+        SQLFreeStmt(st, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, st);
+    }
+    op->ok = 1;
+}
+
+/* XACT_STATE() == -1 → uncommittable (doomed) transaction */
+static void job_txn_doomed(void* arg)
+{
+    OpTxn* op = (OpTxn*)arg;
+    SQLHSTMT st = SQL_NULL_HSTMT;
+    SQLRETURN r;
+    SQLINTEGER state = 0;
+    SQLLEN ind = 0;
+    SQLWCHAR q[] = L"SELECT XACT_STATE()";
+    op->ok = 0;
+    if (InterlockedCompareExchange(&op->cn->txn_active, 0, 0)) {
+        if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, op->cn->hdbc, &st))) {
+            r = SQLExecDirectW(st, q, SQL_NTS);
+            if (SQL_SUCCEEDED(r) && SQL_SUCCEEDED(SQLFetch(st)) &&
+                SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_SLONG, &state, 0, &ind))) {
+                op->ok = (state == -1);
+            }
+            SQLFreeStmt(st, SQL_CLOSE);
+            SQLFreeHandle(SQL_HANDLE_STMT, st);
+        }
+    }
+}
+
+static void job_txn_finalize(void* arg)
+{
+    OpTxn* op = (OpTxn*)arg;
+    SQLRETURN r;
+    int was_active;
+    vms_error_ok(op->err);
+
+    /* non-cancellable: attention is pointless once finalization started */
+    was_active = InterlockedExchange(&op->cn->txn_active, 0);
+    r = SQLEndTran(SQL_HANDLE_DBC, op->cn->hdbc,
+                   op->rollback_op ? SQL_ROLLBACK : SQL_COMMIT);
+    if (!SQL_SUCCEEDED(r)) {
+        int q;
+        VmsErrClass cls = diag_capture(op->err, SQL_HANDLE_DBC, op->cn->hdbc,
+                                       op->rollback_op ? "SQLEndTran rollback" : "SQLEndTran commit", &q);
+        if (q || cls == VMS_ERR_TRANSPORT || cls == VMS_ERR_CONNECT) {
+            /* wire-level failure during COMMIT: outcome unknown. The
+             * connection may have committed before the failure — it must
+             * never be reused. */
+            InterlockedExchange(&op->cn->quarantined, 1);
+            op->result = VMS_TXN_UNKNOWN;
+            return;
+        }
+        if (cls == VMS_ERR_TIMEOUT) {
+            /* lock timeout: retryable; the transaction is still open */
+            if (was_active) InterlockedExchange(&op->cn->txn_active, 1);
+            op->result = VMS_TXN_BUSY;
+            return;
+        }
+        /* other driver errors: treat conservatively as unknown only when a
+         * COMMIT was in flight; rollback failures leave no ambiguity */
+        if (!op->rollback_op && was_active) {
+            InterlockedExchange(&op->cn->quarantined, 1);
+            op->result = VMS_TXN_UNKNOWN;
+        } else {
+            op->result = VMS_TXN_BUSY;
+        }
+        return;
+    }
+    /* restore autocommit so the connection can return to the pool */
+    SQLSetConnectAttr(op->cn->hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)SQL_AUTOCOMMIT_ON, SQL_IS_INTEGER);
+    InterlockedExchange(&op->cn->txn_pinned, 0);
+    op->result = VMS_TXN_OK;
+}
+
+/* ---- R11 public API ---- */
+
+int vms_txn_pin(VmsConnection* cn, VmsError* err)
+{
+    OpTxn op;
+    if (!cn) return -1;
+    op.cn = cn; op.err = err; op.ok = 0; op.name = NULL; op.rollback_op = 0; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_pin, &op);
+    return op.ok ? 0 : -1;
+}
+
+int vms_txn_begin_lazy(VmsConnection* cn, VmsError* err)
+{
+    OpTxn op;
+    if (!cn) return -1;
+    op.cn = cn; op.err = err; op.ok = 0; op.name = NULL; op.rollback_op = 0; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_begin_lazy, &op);
+    return op.ok ? 0 : -1;
+}
+
+int vms_txn_active(VmsConnection* cn)
+{
+    return cn ? (int)InterlockedCompareExchange(&cn->txn_active, 0, 0) : 0;
+}
+
+int vms_txn_savepoint(VmsConnection* cn, const char* name, int rollback_op,
+                      VmsError* err)
+{
+    OpTxn op;
+    if (!cn || !name || !vms_meta_ident_valid(name, 128)) return -1;
+    op.cn = cn; op.err = err; op.ok = 0;
+    op.name = name; op.rollback_op = rollback_op; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_savepoint, &op);
+    return op.ok ? 0 : -1;
+}
+
+int vms_txn_doomed(const VmsConnection* cn)
+{
+    OpTxn op;
+    VmsError scratch;
+    if (!cn) return 0;
+    op.cn = (VmsConnection*)cn; op.err = &scratch; op.ok = 0;
+    op.name = NULL; op.rollback_op = 0; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_doomed, &op);
+    return op.ok;
+}
+
+int vms_txn_validate(const VmsConnection* cn)
+{
+    if (!vms_txn_active((VmsConnection*)cn)) return 0;
+    return !vms_txn_doomed(cn);
+}
+
+VmsTxnResult vms_txn_commit(VmsConnection* cn, VmsError* err)
+{
+    OpTxn op;
+    if (!cn) return VMS_TXN_UNKNOWN;
+    op.cn = cn; op.err = err; op.ok = 0;
+    op.name = NULL; op.rollback_op = 0; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_finalize, &op);
+    return op.result;
+}
+
+VmsTxnResult vms_txn_rollback(VmsConnection* cn, VmsError* err)
+{
+    OpTxn op;
+    if (!cn) return VMS_TXN_UNKNOWN;
+    op.cn = cn; op.err = err; op.ok = 0;
+    op.name = NULL; op.rollback_op = 1; op.result = VMS_TXN_UNKNOWN;
+    vms_worker_run(cn->worker, job_txn_finalize, &op);
+    return op.result;
 }
 
 /* ================= R6 read cursor (independent lease) ================= */
@@ -1341,9 +1649,64 @@ static void job_cursor_fetch(void* arg)
     }
 }
 
+static VmsCursor* cursor_open_impl(VmsConnection* cn, const wchar_t* sql,
+                                   const long long* params, int nparams,
+                                   int shared, VmsError* err);
+static void cursor_open_cleanup(VmsCursor* cur, int owns_row);
+
 VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
                                const long long* params, int nparams,
                                VmsError* err)
+{
+    return cursor_open_impl(cn, sql, params, nparams, 0, err);
+}
+
+/* R11 shared cursor: runs on the parent connection's own HDBC (MARS), so
+ * its rows join the transaction identity. The parent must outlive the
+ * cursor; the cursor never disconnects the shared HDBC. */
+VmsCursor* vms_cursor_open_shared(VmsConnection* cn, const wchar_t* sql,
+                                  const long long* params, int nparams,
+                                  VmsError* err)
+{
+    return cursor_open_impl(cn, sql, params, nparams, 1, err);
+}
+
+/* shared-mode aware cleanup for failed cursor opens; owns_row frees the
+ * row buffer that the caller already stored in cur */
+static void cursor_open_cleanup(VmsCursor* cur, int owns_row)
+{
+    if (!cur) return;
+    if (owns_row && cur->row) {
+        int j;
+        for (j = 0; j < cur->col_count; j++) value_clear(&cur->row[j]);
+        free(cur->row);
+        cur->row = NULL;
+    }
+    if (cur->hstmt) {
+        SQLFreeStmt(cur->hstmt, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
+        cur->hstmt = NULL;
+    }
+    if (cur->own_hdbc) {
+        if (cur->hdbc) {
+            SQLDisconnect(cur->hdbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            cur->hdbc = NULL;
+        }
+        if (cur->worker) {
+            vms_worker_stop(cur->worker);
+            cur->worker = NULL;
+        }
+    }
+    if (cur->meta) HeapFree(GetProcessHeap(), 0, cur->meta);
+    if (cur->param_vals) HeapFree(GetProcessHeap(), 0, cur->param_vals);
+    if (cur->param_inds) HeapFree(GetProcessHeap(), 0, cur->param_inds);
+    HeapFree(GetProcessHeap(), 0, cur);
+}
+
+static VmsCursor* cursor_open_impl(VmsConnection* cn, const wchar_t* sql,
+                                   const long long* params, int nparams,
+                                   int shared, VmsError* err)
 {
     VmsCursor* cur;
     OpCursorOpen open_op;
@@ -1360,49 +1723,61 @@ VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
         vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor");
         return NULL;
     }
-    /* independent lease: own HDBC from the connection's client environment */
-    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, cn->client->env, &cur->hdbc))) {
-        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor lease hdbc");
-        HeapFree(GetProcessHeap(), 0, cur);
-        return NULL;
-    }
-    cur->worker = vms_worker_start();
-    if (!cur->worker) {
-        vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor worker");
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-        HeapFree(GetProcessHeap(), 0, cur);
-        return NULL;
-    }
+    cur->own_hdbc = shared ? 0 : 1;
+    if (!shared) {
+        /* independent lease: own HDBC from the connection's client env */
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, cn->client->env, &cur->hdbc))) {
+            vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor lease hdbc");
+            HeapFree(GetProcessHeap(), 0, cur);
+            return NULL;
+        }
+        cur->worker = vms_worker_start();
+        if (!cur->worker) {
+            vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor worker");
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            HeapFree(GetProcessHeap(), 0, cur);
+            return NULL;
+        }
 
-    /* connect the lease from the parent's stored connstr */
-    if (!cn->last_connstr) {
-        vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
-                      "parent connection has no stored connstr for leases");
-        vms_worker_stop(cur->worker);
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-        HeapFree(GetProcessHeap(), 0, cur);
-        return NULL;
-    }
-    {
-        SQLRETURN r = SQLDriverConnectW(cur->hdbc, NULL,
-                                        (SQLWCHAR*)cn->last_connstr, SQL_NTS,
-                                        NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-        if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
-            int q;
-            diag_capture(err, SQL_HANDLE_DBC, cur->hdbc, "cursor lease connect", &q);
+        /* connect the lease from the parent's stored connstr */
+        if (!cn->last_connstr) {
+            vms_error_set(err, VMS_ERR_INTERNAL, NULL, 0,
+                          "parent connection has no stored connstr for leases");
             vms_worker_stop(cur->worker);
             SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
             HeapFree(GetProcessHeap(), 0, cur);
             return NULL;
         }
+        {
+            SQLRETURN r = SQLDriverConnectW(cur->hdbc, NULL,
+                                            (SQLWCHAR*)cn->last_connstr, SQL_NTS,
+                                            NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+            if (!(r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO)) {
+                int q;
+                diag_capture(err, SQL_HANDLE_DBC, cur->hdbc, "cursor lease connect", &q);
+                vms_worker_stop(cur->worker);
+                SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+                HeapFree(GetProcessHeap(), 0, cur);
+                return NULL;
+            }
+        }
+    } else {
+        /* shared mode: reuse the parent HDBC and its worker (the parent
+         * worker serializes calls on this connection) */
+        cur->hdbc = cn->hdbc;
+        cur->worker = cn->worker;
     }
 
     if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, cur->hdbc, &cur->hstmt))) {
         vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM cursor stmt");
-        SQLDisconnect(cur->hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-        vms_worker_stop(cur->worker);
-        HeapFree(GetProcessHeap(), 0, cur);
+        if (shared) {
+            HeapFree(GetProcessHeap(), 0, cur);
+        } else {
+            SQLDisconnect(cur->hdbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+            vms_worker_stop(cur->worker);
+            HeapFree(GetProcessHeap(), 0, cur);
+        }
         return NULL;
     }
 
@@ -1418,11 +1793,7 @@ VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
             if (vals) HeapFree(GetProcessHeap(), 0, vals);
             if (inds) HeapFree(GetProcessHeap(), 0, inds);
             vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM param storage");
-            SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
-            SQLDisconnect(cur->hdbc);
-            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-            vms_worker_stop(cur->worker);
-            HeapFree(GetProcessHeap(), 0, cur);
+            cursor_open_cleanup(cur, 0);
             return NULL;
         }
         /* copy: the values must outlive deferred binding; ownership moves
@@ -1444,11 +1815,7 @@ VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
         if (!bind_ok) {
             HeapFree(GetProcessHeap(), 0, vals);
             HeapFree(GetProcessHeap(), 0, inds);
-            SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
-            SQLDisconnect(cur->hdbc);
-            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-            vms_worker_stop(cur->worker);
-            HeapFree(GetProcessHeap(), 0, cur);
+            cursor_open_cleanup(cur, 0);
             return NULL;
         }
         cur->param_vals = vals;
@@ -1464,11 +1831,7 @@ VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
     if (!open_op.ok) {
         if (cur->param_vals) HeapFree(GetProcessHeap(), 0, cur->param_vals);
         if (cur->param_inds) HeapFree(GetProcessHeap(), 0, cur->param_inds);
-        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
-        SQLDisconnect(cur->hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-        vms_worker_stop(cur->worker);
-        HeapFree(GetProcessHeap(), 0, cur);
+        cursor_open_cleanup(cur, 1);
         return NULL;
     }
 
@@ -1477,11 +1840,7 @@ VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
     meta_op.ok = 0;
     vms_worker_run(cur->worker, job_cursor_meta, &meta_op);
     if (!meta_op.ok) {
-        SQLFreeHandle(SQL_HANDLE_STMT, cur->hstmt);
-        SQLDisconnect(cur->hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
-        vms_worker_stop(cur->worker);
-        HeapFree(GetProcessHeap(), 0, cur);
+        cursor_open_cleanup(cur, 0);
         return NULL;
     }
     return cur;
@@ -1505,11 +1864,14 @@ void vms_cursor_close(VmsCursor* cur)
     if (cur->param_vals) { HeapFree(GetProcessHeap(), 0, cur->param_vals); cur->param_vals = NULL; }
     if (cur->param_inds) { HeapFree(GetProcessHeap(), 0, cur->param_inds); cur->param_inds = NULL; }
     if (cur->meta) HeapFree(GetProcessHeap(), 0, cur->meta);
-    if (cur->hdbc) {
-        SQLDisconnect(cur->hdbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+    if (cur->own_hdbc) {
+        if (cur->hdbc) {
+            SQLDisconnect(cur->hdbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, cur->hdbc);
+        }
+        if (cur->worker) vms_worker_stop(cur->worker);
     }
-    if (cur->worker) vms_worker_stop(cur->worker);
+    /* shared mode: hdbc/worker belong to the parent — do not touch */
     HeapFree(GetProcessHeap(), 0, cur);
 }
 

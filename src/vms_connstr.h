@@ -33,6 +33,7 @@ typedef struct VmsProfile {
     int login_timeout_sec;     /* >0; 0 = driver default */
     int query_timeout_sec;     /* 0 = none */
     wchar_t app_name[64];      /* ACST app name; default VirtualMSSQL */
+    int mars;                  /* R11: enable MARS for the txn connection */
 } VmsProfile;
 
 /* fill defaults; server must be set by caller afterwards. */

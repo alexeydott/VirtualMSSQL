@@ -64,6 +64,11 @@ int vms_pool_idle_count(const VmsPool* pool)
     return pool ? pool->idle_count : 0;
 }
 
+VmsClient* vms_pool_client(VmsPool* pool)
+{
+    return pool ? pool->client : NULL;
+}
+
 int vms_pool_live_count(const VmsPool* pool)
 {
     return pool ? pool->live_count : 0;

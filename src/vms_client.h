@@ -129,6 +129,45 @@ int vms_conn_exec_dml(VmsConnection* cn, const wchar_t* sql,
                       const int* torder, int ntotal,
                       long long* rows_affected, VmsError* err);
 
+/* ---- R11 explicit transactions (pinned connection) ----
+ * A transaction pins one canonical SQL Server identity for its whole
+ * lifetime: autocommit is switched off and every DML joins the remote
+ * transaction lazily (the first statement issues BEGIN). Finalization is
+ * non-cancellable: once a COMMIT/ROLLBACK wire operation starts it runs to
+ * completion; an interrupted COMMIT yields an unknown outcome and the
+ * connection is quarantined permanently (never returned to the pool). */
+
+/* result classification for txn finalization */
+typedef enum VmsTxnResult {
+    VMS_TXN_OK = 0,        /* committed / rolled back cleanly */
+    VMS_TXN_BUSY,          /* conflicting active op / lock timeout (retryable) */
+    VMS_TXN_ROLLED_BACK,   /* commit refused: doomed txn rolled back instead */
+    VMS_TXN_UNKNOWN        /* outcome unknown: connection is quarantined */
+} VmsTxnResult;
+
+/* switch the connection into manual-commit mode and apply the transaction
+ * primer (XACT_ABORT ON, AUTOBEGINTXN OFF). The connection must not be
+ * returned to the pool while the transaction is open. */
+int vms_txn_pin(VmsConnection* cn, VmsError* err);
+/* lazily start the remote transaction (BEGIN TRAN) if not yet started;
+ * idempotent: safe to call before every DML. */
+int vms_txn_begin_lazy(VmsConnection* cn, VmsError* err);
+/* 1 when the remote transaction is open on this connection. */
+int vms_txn_active(VmsConnection* cn);
+/* execute a savepoint statement: name must be a validated identifier.
+ * op: 0 = SAVE TRANSACTION name, 1 = ROLLBACK TRANSACTION name. */
+int vms_txn_savepoint(VmsConnection* cn, const char* name, int rollback_op,
+                      VmsError* err);
+/* 1 when the server reports an uncommittable transaction
+ * (XACT_STATE() == -1). 0 otherwise (including on errors). */
+int vms_txn_doomed(const VmsConnection* cn);
+/* validation-only check run from xSync: active + not doomed. */
+int vms_txn_validate(const VmsConnection* cn);
+/* finalize: COMMIT or ROLLBACK, then restore autocommit. Non-cancellable.
+ * returns VMS_TXN_OK / VMS_TXN_BUSY / VMS_TXN_UNKNOWN. */
+VmsTxnResult vms_txn_commit(VmsConnection* cn, VmsError* err);
+VmsTxnResult vms_txn_rollback(VmsConnection* cn, VmsError* err);
+
 /* ---- vtab read cursor (R6) ----
  * A cursor is an independent lease over its own ODBC connection lease:
  * two cursors scan concurrently (SQLite nested scans) without sharing
@@ -146,6 +185,13 @@ VmsCursor* vms_cursor_open(VmsConnection* cn, const char* schema,
 VmsCursor* vms_cursor_open_sql(VmsConnection* cn, const wchar_t* sql,
                                const long long* params, int nparams,
                                VmsError* err);
+/* R11: open a cursor that shares the parent connection's HDBC (MARS). Its
+ * reads participate in the transaction pinned on that connection and see
+ * the transaction's own uncommitted writes. The parent connection must
+ * outlive the cursor; cursors on one HDBC are serialized by its worker. */
+VmsCursor* vms_cursor_open_shared(VmsConnection* cn, const wchar_t* sql,
+                                  const long long* params, int nparams,
+                                  VmsError* err);
 void vms_cursor_close(VmsCursor* cur);
 /* fetch next row: 1 = row ready (fully decoded), 0 = end, -1 = error */
 int vms_cursor_fetch(VmsCursor* cur, VmsError* err);

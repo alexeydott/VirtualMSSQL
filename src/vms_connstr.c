@@ -283,8 +283,11 @@ int vms_connstr_build(const VmsProfile* p, wchar_t** out, size_t* out_len,
         break;
     }
 
-    /* deterministic no-retry posture (TZ mandatory) */
-    ok = ok && wacc_add(&a, L"ConnectRetryCount=0;ConnectRetryInterval=1;MARS_Connection=No;");
+    /* deterministic no-retry posture (TZ mandatory); MARS on the txn
+     * connection lets concurrent read cursors share the one identity */
+    ok = ok && wacc_add(&a, L"ConnectRetryCount=0;ConnectRetryInterval=1;MARS_Connection=");
+    ok = ok && wacc_add(&a, p->mars ? L"Yes" : L"No");
+    ok = ok && wacc_add(&a, L";");
 
     /* app name */
     ok = ok && wacc_add(&a, L"APP=") && wacc_add(&a, p->app_name) && wacc_add(&a, L";");
