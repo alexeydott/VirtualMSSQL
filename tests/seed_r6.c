@@ -169,7 +169,16 @@ int main(void)
 
     /* lob row: 200k nvarchar chars via REPLICATE; binary via replicate+cast */
     for (i = 0; ddl[i]; i++) {
-        st = vms_stmt_exec_direct(cn, ddl[i], &err);
+        int attempt;
+        for (attempt = 0; attempt < 3; attempt++) {
+            st = vms_stmt_exec_direct(cn, ddl[i], &err);
+            if (st) break;
+            /* pooled ctest sessions can briefly hold metadata locks on
+             * DROP TABLE; retry a few times before giving up */
+            fprintf(stderr, "ddl[%d] attempt %d: %s\n", i, attempt + 1,
+                    err.message);
+            Sleep(700);
+        }
         if (!st) { fprintf(stderr, "ddl[%d]: %s\n", i, err.message); return 1; }
         vms_stmt_destroy(st);
     }
@@ -202,7 +211,14 @@ int main(void)
             NULL
         };
         for (i = 0; extra[i]; i++) {
-            st = vms_stmt_exec_direct(cn, extra[i], &err);
+            int attempt;
+            for (attempt = 0; attempt < 3; attempt++) {
+                st = vms_stmt_exec_direct(cn, extra[i], &err);
+                if (st) break;
+                fprintf(stderr, "extra[%d] attempt %d: %s\n", i, attempt + 1,
+                        err.message);
+                Sleep(700);
+            }
             if (!st) { fprintf(stderr, "extra[%d]: %s\n", i, err.message); return 1; }
             vms_stmt_destroy(st);
         }

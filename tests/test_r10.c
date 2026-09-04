@@ -136,7 +136,25 @@ int main(int argc, char** argv)
             CHECK(exec_rc(sql, NULL) == SQLITE_OK);
             CHECK(scalar("SELECT COUNT(*) FROM rv WHERE v = 55") == 1);
         }
+        /* exact-row cleanup: delete the inserted v=7 row by its guid and
+         * restore the original row's v back to 5 (row-precise, no v-based
+         * matching), so repeated runs are state-independent */
+        {
+            char* c7 = text_q("SELECT id FROM rv WHERE v = 7");
+            char sql[256];
+            CHECK(c7 != NULL);
+            _snprintf_s(sql, sizeof(sql), _TRUNCATE,
+                        "DELETE FROM rv WHERE id = '%s';", c7);
+            CHECK(exec_rc(sql, NULL) == SQLITE_OK);
+            free(c7);
+            _snprintf_s(sql, sizeof(sql), _TRUNCATE,
+                        "UPDATE rv SET v = 5 WHERE id = '%s';", g);
+            CHECK(exec_rc(sql, NULL) == SQLITE_OK);
+        }
         free(g);
+        CHECK(scalar("SELECT COUNT(*) FROM rv") == 2);
+        CHECK(scalar("SELECT COUNT(*) FROM rv WHERE v = 5") == 1);
+        CHECK(scalar("SELECT COUNT(*) FROM rv WHERE v = 6") == 1);
     }
 
     /* ---- rowversion server-owned: not writable ---- */

@@ -194,13 +194,34 @@ int main(int argc, char** argv)
         CHECK(scalar("SELECT COUNT(*) FROM t14 WHERE id = 2") >= 0);
     }
 
-    /* cleanup: remove the DML row */
+    /* cleanup: remove the DML row. After cancellation games the first
+     * attempt may hit a session still unwinding (2025 driver); retry
+     * briefly and print the reason if it persists. */
     {
         sqlite3_stmt* dst = NULL;
-        CHECK(sqlite3_prepare_v2(g_db, "DELETE FROM t14w WHERE id = 1400", -1,
-                                 &dst, NULL) == SQLITE_OK);
-        CHECK(sqlite3_step(dst) == SQLITE_DONE);
-        sqlite3_finalize(dst);
+        int attempt, done = 0;
+        for (attempt = 0; attempt < 5 && !done; attempt++) {
+            if (sqlite3_prepare_v2(g_db, "DELETE FROM t14w WHERE id = 1400", -1,
+                                   &dst, NULL) != SQLITE_OK) {
+                fprintf(stderr, "r14 cleanup prepare: %s\n",
+                        sqlite3_errmsg(g_db));
+                Sleep(200);
+                continue;
+            }
+            if (sqlite3_step(dst) != SQLITE_DONE) {
+                fprintf(stderr, "r14 cleanup step: %s\n",
+                        sqlite3_errmsg(g_db));
+                sqlite3_finalize(dst);
+                dst = NULL;
+                Sleep(200);
+                continue;
+            }
+            sqlite3_finalize(dst);
+            dst = NULL;
+            done = 1;
+        }
+        CHECK(done);
+        if (dst) sqlite3_finalize(dst);
     }
     sqlite3_exec(g_db, "DROP TABLE IF EXISTS t14; DROP TABLE IF EXISTS t14w;",
                  NULL, NULL, NULL);

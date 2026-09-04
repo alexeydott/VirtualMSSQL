@@ -38,7 +38,16 @@ static int exec_rc_e(const char* sql, char** err_out)
 
 static int exec_rc(const char* sql)
 {
-    return exec_rc_e(sql, NULL);
+    char* err = NULL;
+    int rc = exec_rc_e(sql, &err);
+    if (rc != SQLITE_OK) {
+        /* G17 diagnostics: print the server-side reason for intermittent
+         * matrix failures (e.g. 2025-specific transaction behavior) */
+        fprintf(stderr, "SQL[%s] rc=%d err=%s\n", sql, rc,
+                err ? err : "(no message)");
+        if (err) sqlite3_free(err);
+    }
+    return rc;
 }
 
 int main(int argc, char** argv)
