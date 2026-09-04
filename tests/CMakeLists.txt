@@ -14,6 +14,22 @@ set(VMS_SQLITE_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/bin/${VMS_ARC
 # place the host sqlite3.dll next to every test executable that links it
 file(COPY "${VMS_SQLITE_BIN_DIR}/sqlite3.dll" DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
+# R16: when the sanitizer build is active, test executables must be
+# instrumented too (the vms_client static lib is already instrumented, and
+# every test links it). The dynamic ASan runtime is one DLL per arch for
+# all runtime configurations; it must sit next to every instrumented
+# binary (see MSVC "one DLL for all runtime configurations").
+if(VMS_ASAN)
+    set(VMS_ASAN_RT "D:/Visual Studio2022/VC/Tools/Llvm/x64/lib/clang/19/lib/windows")
+    set(VMS_ASAN_DLL "D:/Visual Studio2022/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/clang_rt.asan_dynamic-x86_64.dll")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer /O1 /MD)
+    add_link_options(-fsanitize=address,undefined
+        "${VMS_ASAN_RT}/clang_rt.asan_dynamic-x86_64.lib"
+        "${VMS_ASAN_RT}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib"
+        "${VMS_ASAN_RT}/clang_rt.ubsan_standalone-x86_64.lib")
+    file(COPY "${VMS_ASAN_DLL}" DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 # ---- harness implementation (static; linked into tests that need sqlite3) ----
 add_library(vms_test_harness STATIC test_harness_impl.c)
 target_include_directories(vms_test_harness PUBLIC
@@ -75,6 +91,33 @@ target_include_directories(test_foundation PRIVATE
 )
 target_compile_definitions(test_foundation PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_test(NAME foundation COMMAND test_foundation)
+
+# ---- suite 18: fuzz / fault injection (G16; offline) ----
+# Own source copies compiled with SQLITE_OMIT_LOAD_EXTENSION: the api-thunk
+# extern (sqlite3_api) only exists inside the DLL, and this suite must not
+# carry the ODBC adapter. The plan/lexer/meta surfaces are pure CPU code.
+add_executable(test_r16 test_r16.c
+    ../src/vms_foundation.c
+    ../src/vms_limits.c
+    ../src/vms_log.c
+    ../src/vms_faultalloc.c
+    ../src/vms_connstr.c
+    ../src/vms_credentials.c
+    ../src/vms_plan.c
+    ../src/vms_identity.c
+    ../src/vms_meta_cache.c
+    ../src/vms_lexer.c
+)
+target_include_directories(test_r16 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_compile_definitions(test_r16 PRIVATE
+    _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    SQLITE_OMIT_LOAD_EXTENSION)
+target_link_libraries(test_r16 PRIVATE "${VMS_SQLITE_BIN_DIR}/sqlite3.lib")
+target_compile_options(test_r16 PRIVATE /utf-8)
+add_test(NAME r16 COMMAND test_r16)
 
 # ---- suite 6: client runtime integration (G3; needs live SQL Server) ----
 add_executable(test_client test_client.c)

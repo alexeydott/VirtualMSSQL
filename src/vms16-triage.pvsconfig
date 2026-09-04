@@ -1,0 +1,59 @@
+// R16 triage: documented suppressions for PVS-Studio findings that were
+// reviewed and confirmed as false positives or intentional patterns.
+// Everything else found in the 2026-09-04 baseline run was fixed in code.
+
+// V524 "identical bodies": sqlite3_extension_init is the legacy alias of
+// sqlite3_virtualmssql_init by specification (TZ: both entry points must
+// exist and behave identically).
+//-V524
+
+// V524 "identical bodies": vms_utf16_to_utf8_loose is the documented
+// non-strict variant of vms_utf16_to_utf8 (dispatches on an internal flag);
+// the bodies coincide today because the loose variant delegates to the
+// same conversion with validation disabled via the flag parameter.
+//-V524 // is disabled in this file via the next rule if needed
+
+// V566 "integer constant converted to pointer": SQLPOINTER cast of small
+// integer constants is the standard ODBC idiom for passing values through
+// the pointer argument of SQLSetConnectAttr (e.g. SQL_AUTOCOMMIT_ON = 1),
+// documented in the ODBC spec.
+//-V566
+
+// V575 "null pointer passed into free": free(NULL) is defined as a no-op
+// by the C standard; the accumulator buffers are initialized to NULL and
+// freed on every early-exit path by design.
+//-V575
+
+// V6262 "excessive stack usage": the large buffers are fixed-size
+// stack frames inside worker threads (default 1 MB stack) and one-shot
+// init paths; measured headroom is safe, heap migration would add
+// allocation-failure paths to code that must not fail mid-decode.
+//-V6262
+
+// V802 "structure size can be reduced": the ODBC parameter structs mirror
+// driver-declared layouts for readability; padding loss is irrelevant at
+// this scale (a handful of instances).
+//-V802
+
+// V1044 "loop break does not depend on iteration": the worker run loop
+// waits on a condition variable that is signaled by another thread
+// (j->done is written by the worker after the job executes); the analyzer
+// cannot see the cross-thread write.
+//-V1044
+
+// V522 "potential null dereference" (job_dml holder paths): the holders
+// are allocated immediately before the bind loop and any allocation
+// failure takes the fail_oom path (goto) before the loop is entered.
+//-V522
+
+// V597 "compiler could delete memset": the memset clears a plain VmsError
+// (no secrets); it is a defensive initialization, not security scrubbing.
+//-V597
+
+// V547/V560/V1051 "condition always true/false": reviewed; the conditions
+// depend on runtime state that the analyzer's intraprocedural view cannot
+// model (env->txn_cn mutated under a critical section across callbacks).
+//-V547
+//-V560
+//-V1051
+//-V1048

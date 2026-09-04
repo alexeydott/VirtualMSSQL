@@ -43,20 +43,20 @@ int vms_plan_compile(sqlite3_index_info* info, const VmsMetaColumn* cols,
     /* projection: mark consumed columns; colUsed bit 63 covers columns >= 62
      * and cannot be trusted per docs — if set, fall back to all columns. */
     if (info->colUsed & ((sqlite3_uint64)1 << 63)) {
-        plan->used_mask = -1; /* all */
+        plan->used_mask = 0xFFFFFFFFu; /* all */
     } else {
         for (i = 0; i < ncols && i < 62; i++) {
             if (info->colUsed & ((sqlite3_uint64)1 << i))
-                plan->used_mask |= (1 << i);
+                plan->used_mask |= (1u << i);
         }
         /* always project the columns referenced by constraints/order too */
         for (i = 0; i < info->nConstraint; i++) {
             int c = info->aConstraint[i].iColumn;
-            if (c >= 0 && c < 62) plan->used_mask |= (1 << c);
+            if (c >= 0 && c < 62) plan->used_mask |= (1u << c);
         }
         for (i = 0; i < info->nOrderBy; i++) {
             int c = info->aOrderBy[i].iColumn;
-            if (c >= 0 && c < 62) plan->used_mask |= (1 << c);
+            if (c >= 0 && c < 62) plan->used_mask |= (1u << c);
         }
     }
 
@@ -97,7 +97,7 @@ int vms_plan_compile(sqlite3_index_info* info, const VmsMetaColumn* cols,
 
         info->aConstraintUsage[i].argvIndex = t->arg_index + 1;
         info->aConstraintUsage[i].omit = 1;
-        plan->omit_mask |= (1 << i);
+        plan->omit_mask |= (1u << i);
         plan->nterms++;
     }
 
@@ -121,7 +121,7 @@ int vms_plan_compile(sqlite3_index_info* info, const VmsMetaColumn* cols,
         t->arg_index = nargs++;
         info->aConstraintUsage[i].argvIndex = t->arg_index + 1;
         info->aConstraintUsage[i].omit = 1;
-        plan->omit_mask |= (1 << i);
+        plan->omit_mask |= (1u << i);
         plan->nterms++;
     }
 
@@ -280,14 +280,14 @@ int vms_plan_build_sql(const VmsPlan* plan, const char* schema, const char* tabl
             if (i && !append_w(sql, sql_wchars, &len, L", ")) return 0;
             if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
         }
-    } else if (plan->used_mask == -1) {
+    } else if (plan->used_mask == 0xFFFFFFFFu) {
         for (i = 0; i < ncols; i++) {
             if (i && !append_w(sql, sql_wchars, &len, L", ")) return 0;
             if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
         }
     } else {
         for (i = 0; i < ncols && i < 62; i++) {
-            if (!(plan->used_mask & (1 << i))) continue;
+            if (!(plan->used_mask & (1u << i))) continue;
             if (!first && !append_w(sql, sql_wchars, &len, L", ")) return 0;
             if (!append_col_proj(sql, sql_wchars, &len, &cols[i], spatial_wkt)) return 0;
             first = 0;
@@ -329,7 +329,8 @@ int vms_plan_build_sql(const VmsPlan* plan, const char* schema, const char* tabl
         case VMS_OP_GE: if (!append_w(sql, sql_wchars, &len, L" >= ?")) return 0; break;
         case VMS_OP_ISNULL: if (!append_w(sql, sql_wchars, &len, L" IS NULL")) return 0; break;
         case VMS_OP_ISNOTNULL: if (!append_w(sql, sql_wchars, &len, L" IS NOT NULL")) return 0; break;
-        case VMS_OP_IN: if (!append_w(sql, sql_wchars, &len, L" = ?")) return 0; break;
+        case VMS_OP_IN: /* V1037: IN binds as equality to the single value */
+            if (!append_w(sql, sql_wchars, &len, L" = ?")) return 0; break;
         default: return 0;
         }
     }

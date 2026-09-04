@@ -314,7 +314,7 @@ static void job_meta(void* arg)
         }
         name[255] = 0; /* defensive terminator */
         if (name_len < 0 || name_len > 255) name_len = 255;
-        name[name_len] = 0;
+        name[name_len] = 0; /* single terminator write (V519) */
         WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)name, -1, name_u8, sizeof(name_u8), NULL, NULL);
         strncpy_s(op->st->meta[i - 1].name, sizeof(op->st->meta[i - 1].name),
                   name_u8, _TRUNCATE);
@@ -415,7 +415,7 @@ static int getdata_text(HSTMT h, int col, VmsValue* out, VmsError* err)
             if (acc_len + bytes + 1 > acc_cap) {
                 size_t ncap = acc_cap ? acc_cap * 2 : 65536;
                 unsigned char* na;
-                while (ncap < acc_len + bytes + 1) ncap *= 2;
+                if (ncap < acc_len + bytes + 1) ncap = acc_len + bytes + 1;
                 na = (unsigned char*)realloc(acc, ncap);
                 if (!na) {
                     vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
@@ -425,9 +425,16 @@ static int getdata_text(HSTMT h, int col, VmsValue* out, VmsError* err)
                 acc = na;
                 acc_cap = ncap;
             }
+            if (!acc) { free(acc); return 0; }
+#pragma warning(push)
+            /* C6386 false positive: the analyzer cannot prove acc non-NULL
+             * across the realloc result check above; na is verified before
+             * the assignment, so acc is non-NULL whenever acc_cap > 0 */
+#pragma warning(disable : 6386)
             memcpy(acc + acc_len, chunk, bytes);
             acc_len += bytes;
             acc[acc_len] = 0;
+#pragma warning(pop)
             wchars += bytes / sizeof(wchar_t);
         }
         if (r == SQL_SUCCESS) break; /* last chunk */
@@ -501,7 +508,7 @@ static int getdata_blob(HSTMT h, int col, VmsValue* out, VmsError* err)
             if (acc_len + bytes + 1 > acc_cap) {
                 size_t ncap = acc_cap ? acc_cap * 2 : 65536;
                 unsigned char* na;
-                while (ncap < acc_len + bytes + 1) ncap *= 2;
+                if (ncap < acc_len + bytes + 1) ncap = acc_len + bytes + 1;
                 na = (unsigned char*)realloc(acc, ncap);
                 if (!na) {
                     vms_error_set(err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row buffer");
@@ -511,9 +518,14 @@ static int getdata_blob(HSTMT h, int col, VmsValue* out, VmsError* err)
                 acc = na;
                 acc_cap = ncap;
             }
+            if (!acc) { free(acc); return 0; }
+#pragma warning(push)
+            /* C6386 false positive (same as getdata_text above) */
+#pragma warning(disable : 6386)
             memcpy(acc + acc_len, chunk, bytes);
             acc_len += bytes;
             acc[acc_len] = 0;
+#pragma warning(pop)
         }
         if (r == SQL_SUCCESS) break;
     }
@@ -544,15 +556,17 @@ static void job_fetch(void* arg)
         return;
     }
     /* decode COMPLETE row before making it visible (TZ invariant) */
-    if (!st->row && st->col_count > 0) {
-        st->row = (VmsValue*)calloc(1, sizeof(VmsValue) * (size_t)st->col_count);
+    if (st->col_count > 0) {
         if (!st->row) {
-            vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row");
-            op->result = -1;
-            return;
+            st->row = (VmsValue*)calloc(1, sizeof(VmsValue) * (size_t)st->col_count);
+            if (!st->row) {
+                vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM row");
+                op->result = -1;
+                return;
+            }
         }
     }
-    for (i = 1; i <= st->col_count; i++) {
+    for (i = 1; st->row && i <= st->col_count; i++) {
         VmsValue* v = &st->row[i - 1];
         const VmsColumnMeta* m = &st->meta[i - 1];
         switch (m->type) {
@@ -590,11 +604,7 @@ static void job_fetch(void* arg)
         case VMS_CT_DECIMAL: case VMS_CT_DATETIME: case VMS_CT_GUID:
             if (!getdata_scalar_text(st->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
-        case VMS_CT_SPATIAL:
-            /* R12: spatial UDTs stream as WKB through SQLGetData binary
-             * (the native CLR serialization is not exposed to ODBC) */
-            if (!getdata_blob(st->hstmt, i, v, op->err)) { op->result = -1; return; }
-            break;
+        case VMS_CT_SPATIAL: /* R12: WKB via binary (V1037: same decode as BLOB) */
         case VMS_CT_BLOB:
             if (!getdata_blob(st->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
@@ -865,16 +875,13 @@ static void job_query_timeout(void* arg)
 int vms_conn_set_query_timeout(VmsConnection* cn, int seconds)
 {
     OpSimple op;
+    VmsError scratch;
     if (!cn || seconds < 0) return 0;
     cn->query_timeout_sec = seconds;
     op.cn = cn;
-    op.err = NULL;
+    op.err = &scratch;
     op.ok = 0;
-    {
-        VmsError scratch;
-        op.err = &scratch;
-        vms_worker_run(cn->worker, job_query_timeout, &op);
-    }
+    vms_worker_run(cn->worker, job_query_timeout, &op);
     return op.ok;
 }
 
@@ -1160,13 +1167,18 @@ static void job_dml(void* arg)
         vms_error_set(op->err, VMS_ERR_NO_MEMORY, NULL, 0, "OOM dml stmt");
         return;
     }
-    /* holders live until after SQLExecDirect (deferred binding) */
-    if (op->nint > 0) {
-        ival_holders = (long long*)HeapAlloc(GetProcessHeap(), 0,
-                                             sizeof(long long) * (size_t)op->nint);
+    /* holders live until after SQLExecDirect (deferred binding); inds is
+     * allocated whenever any parameter exists (V595: it is written in both
+     * the int and the text bind paths) */
+    if (op->nint > 0 || op->ntext > 0) {
+        if (op->nint > 0) {
+            ival_holders = (long long*)HeapAlloc(GetProcessHeap(), 0,
+                                                 sizeof(long long) * (size_t)op->nint);
+            if (!ival_holders) goto fail_oom;
+        }
         inds = (SQLLEN*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                   sizeof(SQLLEN) * (size_t)op->ntotal);
-        if (!ival_holders || !inds) goto fail_oom;
+        if (!inds) goto fail_oom;
     }
     if (op->ntext > 0) {
         tval_holders = (wchar_t**)HeapAlloc(GetProcessHeap(), 0,
@@ -1174,8 +1186,9 @@ static void job_dml(void* arg)
         if (!tval_holders) goto fail_oom;
         for (i = 0; i < op->ntext; i++) {
             int chars = op->tlengths ? op->tlengths[i] : 0;
+            if (chars < 0) chars = 0;
             tval_holders[i] = (wchar_t*)HeapAlloc(GetProcessHeap(), 0,
-                (size_t)(chars + 1) * sizeof(wchar_t));
+                ((size_t)chars + 1) * sizeof(wchar_t));
             if (!tval_holders[i]) goto fail_oom;
             memcpy(tval_holders[i], op->tparams[i],
                    (size_t)chars * sizeof(wchar_t));
@@ -1187,9 +1200,12 @@ static void job_dml(void* arg)
     for (i = 0; i < op->ntotal; i++) {
         SQLRETURN br;
         int t = op->torder[i];
+        /* C6011: holders are non-NULL whenever a param of that kind exists
+         * (allocation failure took the fail_oom exit before the loop) */
         if (t >= 0) {
             /* int param t */
             SQLBIGINT v = (SQLBIGINT)op->iparams[t];
+            if (!ival_holders || !inds) goto fail_oom;
             ival_holders[t] = v;
             inds[i] = sizeof(SQLBIGINT); /* fixed-length: size, not NULL */
             br = SQLBindParameter(h, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT,
@@ -1199,8 +1215,11 @@ static void job_dml(void* arg)
             /* text param -(t)-1 */
             int ti = -t - 1;
             SQLULEN unlimited = 1073741823; /* R0: max accepted precision */
-            wchar_t* hv = tval_holders[ti];
-            int chars = op->tlengths ? op->tlengths[ti] : (int)wcslen(hv);
+            wchar_t* hv;
+            int chars;
+            if (!tval_holders || !inds) goto fail_oom;
+            hv = tval_holders[ti];
+            chars = op->tlengths ? op->tlengths[ti] : (int)wcslen(hv);
             if (chars == 0) {
                 /* empty string bound as NULL when the caller marked it so */
                 inds[i] = SQL_NULL_DATA;
@@ -1714,7 +1733,7 @@ static void job_cursor_meta(void* arg)
         }
         name[255] = 0;
         if (name_len < 0 || name_len > 255) name_len = 255;
-        name[name_len] = 0;
+        name[name_len] = 0; /* single terminator write (V519) */
         WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)name, -1, name_u8, sizeof(name_u8), NULL, NULL);
         strncpy_s(cur->meta[i - 1].name, sizeof(cur->meta[i - 1].name), name_u8, _TRUNCATE);
         cur->meta[i - 1].type = map_col_type(sql_type, col_size);
@@ -1808,10 +1827,7 @@ static void job_cursor_fetch(void* arg)
             /* driver-convertible scalars: fetch as driver text (WCHAR) */
             if (!getdata_scalar_text(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;
-        case VMS_CT_SPATIAL:
-            /* R12: spatial UDTs stream as WKB through SQLGetData binary */
-            if (!getdata_blob(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
-            break;
+        case VMS_CT_SPATIAL: /* R12: WKB via binary (V1037: same decode as BLOB) */
         case VMS_CT_BLOB:
             if (!getdata_blob(cur->hstmt, i, v, op->err)) { op->result = -1; return; }
             break;

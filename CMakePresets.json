@@ -46,13 +46,24 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "asan-x64",
+            "inherits": "win-base",
+            "displayName": "x64 ASan (clang-cl from the MSVC toolchain; needs vcvarsall x64)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "D:/Visual Studio2022/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+                "VMS_ASAN": "ON"
+            }
         }
     ],
     "buildPresets": [
         { "name": "x64-debug", "configurePreset": "x64-debug" },
         { "name": "x64-release", "configurePreset": "x64-release" },
         { "name": "win32-debug", "configurePreset": "win32-debug" },
-        { "name": "win32-release", "configurePreset": "win32-release" }
+        { "name": "win32-release", "configurePreset": "win32-release" },
+        { "name": "asan-x64", "configurePreset": "asan-x64" }
     ],
     "testPresets": [
         {
@@ -73,6 +84,11 @@
         {
             "name": "win32-release",
             "configurePreset": "win32-release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "asan-x64",
+            "configurePreset": "asan-x64",
             "output": { "outputOnFailure": true }
         }
     ]

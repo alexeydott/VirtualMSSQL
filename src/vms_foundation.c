@@ -78,7 +78,8 @@ void vms_buf_free(VmsBounded* b)
 int vms_buf_append(VmsBounded* b, const void* src, size_t len)
 {
     size_t need;
-    if (!b->data && b->cap > 0) return 0;
+    if (!b || !src) return 0;
+    if (!b->data || b->cap == 0) return 0; /* C6387/C6011: explicit invariant */
     if (!vms_add_sz(b->len, len, &need)) return 0;
     if (need > b->cap) return 0;
     memcpy(b->data + b->len, src, len);
@@ -90,23 +91,35 @@ int vms_buf_append(VmsBounded* b, const void* src, size_t len)
 int vms_buf_append_grow(VmsBounded* b, const void* src, size_t len)
 {
     size_t need;
+    if (!b || !src) return 0;
+    if (b->len > 0 && !b->data) return 0; /* inconsistent state */
+    if (b->cap > 0 && !b->data) return 0; /* inconsistent state */
     if (!vms_add_sz(b->len, len, &need)) return 0;
     if (need > b->cap) {
+        /* new capacity: >= need + 1, at least 4096, grown by doubling */
         size_t ncap = b->cap ? b->cap : 4096;
         char* nd;
-        while (ncap < need) {
-            if (!vms_add_sz(ncap, ncap, &ncap)) return 0; /* overflow */
-        }
-        if (!vms_add_sz(ncap, 1, &ncap)) return 0;
-        nd = (char*)HeapAlloc(GetProcessHeap(), 0, ncap);
+        if (ncap < 4096) ncap = 4096;
+        if (ncap < need) ncap = need;
+        if (ncap > SIZE_MAX - 1) return 0;
+        nd = (char*)HeapAlloc(GetProcessHeap(), 0, ncap + 1);
         if (!nd) return 0;
         if (b->data) {
-            memcpy(nd, b->data, b->len + 1);
+            memcpy(nd, b->data, b->len);
             SecureZeroMemory(b->data, b->cap);
             HeapFree(GetProcessHeap(), 0, b->data);
         }
         b->data = nd;
-        b->cap = ncap - 1;
+        b->cap = ncap;
+    }
+    if (!b->data) {
+        /* len == 0 && cap == 0: nothing buffered; grow first */
+        char* nd;
+        nd = (char*)HeapAlloc(GetProcessHeap(), 0, 4096);
+        if (!nd) return 0;
+        nd[0] = 0;
+        b->data = nd;
+        b->cap = 4095;
     }
     memcpy(b->data + b->len, src, len);
     b->len = need;

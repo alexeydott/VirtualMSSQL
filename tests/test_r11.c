@@ -139,15 +139,26 @@ int main(int argc, char** argv)
     CHECK(scalar("SELECT COUNT(*) FROM t11") >= 3);
     CHECK(exec_rc("COMMIT;") == SQLITE_OK);
 
-    /* cleanup: remove rows created in this test */
+    /* cleanup: remove rows created in this test. Two passes: the DELETE
+     * scan runs on an independent cursor; a row inserted through the very
+     * first transaction of the connection may be missed by a single
+     * streaming pass (server-side visibility timing), so repeat until no
+     * rows >= 1100 remain (bounded by 5 passes). */
     {
         sqlite3_stmt* st = NULL;
+        int pass;
         CHECK(exec_rc("CREATE VIRTUAL TABLE t11d USING virtualmssql("
                       "schema='dbo', table='vms10_dml', mode='rw');") == SQLITE_OK);
-        CHECK(sqlite3_prepare_v2(g_db, "DELETE FROM t11d WHERE id >= 1100", -1,
-                                  &st, NULL) == SQLITE_OK);
-        CHECK(sqlite3_step(st) == SQLITE_DONE);
-        sqlite3_finalize(st);
+        for (pass = 0; pass < 5; pass++) {
+            CHECK(sqlite3_prepare_v2(g_db, "DELETE FROM t11d WHERE id >= 1100", -1,
+                                      &st, NULL) == SQLITE_OK);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+            st = NULL;
+            if (scalar("SELECT COUNT(*) FROM t11d WHERE id >= 1100") == 0) break;
+        }
+        CHECK(scalar("SELECT COUNT(*) FROM t11d WHERE id >= 1100") == 0);
+        if (st) sqlite3_finalize(st);
     }
 
     sqlite3_exec(g_db, "DROP TABLE IF EXISTS t11; DROP TABLE IF EXISTS t11d;",

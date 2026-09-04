@@ -246,7 +246,6 @@ int vms_mat_build(VmsMat* m, VmsConnection* cn, const VmsQuerySource* src,
         }
         for (i = 0; i < src->ncols; i++) {
             const VmsValue* v = vms_cursor_value(cur, i);
-            if (!v) v = NULL;
             if (!bind_value(insert, i + 1, v ? v : &(VmsValue){VMS_VAL_NULL})) {
                 vms_cursor_close(cur);
                 sqlite3_finalize(insert);
@@ -295,8 +294,7 @@ int vms_mat_build(VmsMat* m, VmsConnection* cn, const VmsQuerySource* src,
      * published state, and the state store swap is a single critical-
      * section assignment. */
     EnterCriticalSection(&m->cs);
-    m->state = VMS_MAT_READY;
-    m->state = VMS_MAT_PUBLISHED;
+    m->state = VMS_MAT_PUBLISHED; /* READY step elided: readers check only PUBLISHED/FAILED */
     LeaveCriticalSection(&m->cs);
     return 1;
 }

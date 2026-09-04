@@ -5,6 +5,7 @@
  * policy for sql_variant. */
 #include "sqlite3.h"
 #include <windows.h>
+#include <io.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

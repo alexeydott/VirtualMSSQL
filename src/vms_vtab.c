@@ -99,6 +99,9 @@ static VmsVtabEnv* g_env = NULL; /* single-module env for R6 */
 /* R11 forward decls (used by xFilter / best_index before their definitions) */
 static VmsConnection* txn_current(VmsVtabEnv* env);
 static int vtab_dml_ctx(struct VmsVtab* tab, VmsDmlContext** out, VmsError* err);
+/* R13 forward decls (V1031) */
+static int vms_vtab_shadow_name(const char* name);
+static int vms_vtab_next(sqlite3_vtab_cursor* cursor);
 
 /* ---------- module helpers ---------- */
 
@@ -149,20 +152,26 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
         } else if (!strncmp(a, "source=", 7)) {
             const char* sv = a + 7;
             if (sv[0] == '\'') sv++; /* strip leading quote */
-            if (strncmp(sv, "query", 5) && strncmp(sv, "table", 5)) {
+            /* V526 clarity: strncmp returns 0 on match */
+            if (strncmp(sv, "query", 5) == 0) {
+                is_query = 1;
+            } else if (strncmp(sv, "table", 5) == 0) {
+                is_query = 0;
+            } else {
                 *pzErr = sqlite3_mprintf("virtualmssql: source must be 'table' or 'query'");
                 return SQLITE_ERROR;
             }
-            is_query = !strncmp(sv, "query", 5);
         } else if (!strncmp(a, "mode=", 5)) {
             const char* mv = a + 5;
             if (mv[0] == '\'') mv++;
-            if (strncmp(mv, "rw", 2) && strncmp(mv, "ro", 2) &&
-                strncmp(mv, "rw'", 3) && strncmp(mv, "ro'", 3)) {
+            if (strncmp(mv, "rw", 2) == 0 || strncmp(mv, "rw'", 3) == 0) {
+                rw = 1;
+            } else if (strncmp(mv, "ro", 2) == 0 || strncmp(mv, "ro'", 3) == 0) {
+                rw = 0;
+            } else {
                 *pzErr = sqlite3_mprintf("virtualmssql: mode must be 'ro' or 'rw'");
                 return SQLITE_ERROR;
             }
-            rw = !strncmp(mv, "rw", 2);
         } else if (!strncmp(a, "query=", 6)) {
             query = a + 6;
         } else if (!strncmp(a, "materialization=", 16)) {
@@ -530,14 +539,14 @@ static int vms_vtab_best_index(sqlite3_vtab* vtab, sqlite3_index_info* info)
     if (tab->rw_mode) {
         VmsDmlContext* d;
         VmsError derr;
-        memset(&derr, 0, sizeof(derr));
+        derr = (VmsError){0};
         if (vtab_dml_ctx(tab, &d, &derr)) {
             int k, j;
             for (k = 0; k < d->key.part_count; k++) {
                 for (j = 0; j < tab->ncols; j++) {
                     if (!_stricmp(tab->cols[j].name, d->key.parts[k].name) &&
                         j < 62) {
-                        plan.used_mask |= (1 << j);
+                        plan.used_mask |= (1u << j);
                     }
                 }
             }
@@ -817,7 +826,22 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
     } else {
         VmsConnection* txn_cn = txn_current(tab->env);
         if (txn_cn) {
-            cur->cur = vms_cursor_open_shared(txn_cn, sql, NULL, 0, &err);
+            /* V614 fix: the shared-cursor path needs explicit remote SQL
+             * (unlike vms_cursor_open, it cannot build the projection from
+             * metadata). Build an all-columns plan SQL here. */
+            VmsPlan full;
+            int np = 0;
+            memset(&full, 0, sizeof(full));
+            full.magic = VMS_PLAN_MAGIC;
+            full.used_mask = 0xFFFFFFFFu; /* all columns */
+            if (vms_plan_build_sql(&full, tab->schema, tab->table,
+                                   tab->cols, tab->ncols, tab->spatial_wkt,
+                                   sql, 2048, &np)) {
+                cur->cur = vms_cursor_open_shared(txn_cn, sql, NULL, 0, &err);
+            } else {
+                vms_error_set(&err, VMS_ERR_INTERNAL, NULL, 0,
+                              "plan SQL build failed (txn full scan)");
+            }
         } else {
             cur->cur = vms_cursor_open(lease, tab->schema, tab->table,
                                        tab->cols, tab->ncols, &err);
@@ -884,8 +908,8 @@ static int vms_vtab_filter(sqlite3_vtab_cursor* cursor, int idxNum,
         int vcol, proj = 0;
         for (vcol = 0; vcol < tab->ncols && vcol < 512; vcol++) {
             int projected;
-            if (have_plan && plan.used_mask != 0 && plan.used_mask != -1)
-                projected = (vcol < 62) && (plan.used_mask & (1 << vcol));
+            if (have_plan && plan.used_mask != 0 && plan.used_mask != 0xFFFFFFFFu)
+                projected = (vcol < 62) && (plan.used_mask & (1u << vcol));
             else
                 projected = 1; /* full scan or all-columns plan */
             cur->col_map[vcol] = projected ? proj++ : -1;
@@ -1034,7 +1058,7 @@ static int vms_vtab_rowid(sqlite3_vtab_cursor* cursor, sqlite3_int64* pRowid)
     if (cur->cur && tab->ncols > 0 && tab->rw_mode) {
         VmsDmlContext* d;
         VmsError derr;
-        memset(&derr, 0, sizeof(derr));
+        derr = (VmsError){0};
         /* only reuse an existing DML context: creating one here would run
          * catalog queries on the scan connection while it is busy streaming
          * this very result set (driver error HY000 "connection busy") */
@@ -1071,9 +1095,10 @@ static int vms_vtab_rowid(sqlite3_vtab_cursor* cursor, sqlite3_int64* pRowid)
         }
     }
     if (cur->cur && tab->ncols > 0) {
-        int k, j;
-        for (k = 0; k < 1; k++) {
-            /* first key part that is an integer column (R5 key order) */
+        int j;
+        {
+            /* first key part that is an integer column (R5 key order);
+             * V1008: the outer 1-iteration loop was removed */
             for (j = 0; j < tab->ncols; j++) {
                 const VmsValue* v;
                 if (cur->col_map[j] < 0) continue;
@@ -1082,7 +1107,6 @@ static int vms_vtab_rowid(sqlite3_vtab_cursor* cursor, sqlite3_int64* pRowid)
                 if (v && v->type == VMS_VAL_INT64) { *pRowid = (sqlite3_int64)v->i; return SQLITE_OK; }
                 break;
             }
-            break;
         }
     }
     *pRowid = cur->rowid_counter;

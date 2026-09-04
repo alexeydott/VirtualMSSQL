@@ -48,8 +48,9 @@ typedef struct VmsPlanTerm {
 
 typedef struct VmsPlan {
     unsigned magic;
-    int used_mask;               /* projection: bits of columns we select */
-    int omit_mask;               /* constraints SQLite lets us omit locally */
+    unsigned used_mask;          /* projection: bits of columns we select
+                                  * (unsigned: shift by 31+ is defined) */
+    unsigned omit_mask;          /* constraints SQLite lets us omit locally */
     VmsPlanTerm terms[VMS_PLAN_MAX_ARGS];
     int nterms;
     int nargs;                   /* total argv values consumed */

@@ -138,8 +138,10 @@ static int sb_add_value(SqlB* b, const VmsValue* tmp)
     if (tmp->type == VMS_VAL_TEXT) {
         int wlen = MultiByteToWideChar(CP_UTF8, 0, tmp->text,
                                        (int)tmp->text_len, NULL, 0);
-        wchar_t* wv = (wchar_t*)malloc((size_t)(wlen + 1) * sizeof(wchar_t));
+        wchar_t* wv;
         int k;
+        if (wlen < 0) wlen = 0;
+        wv = (wchar_t*)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
         if (!wv) return 0;
         MultiByteToWideChar(CP_UTF8, 0, tmp->text, (int)tmp->text_len, wv, wlen);
         wv[wlen] = 0;

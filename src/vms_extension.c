@@ -146,6 +146,10 @@ static const char* kStubSchema =
 static char g_profile_spec[1024];
 static sqlite3* g_profile_db = NULL;
 
+/* V1031: declared before first use (the profile scalar runs above the
+ * definition further down in this file) */
+static int vms_vtab_env_init(sqlite3* db, char** pzErrMsg);
+
 static void profile_set_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
 {
     (void)argc;
