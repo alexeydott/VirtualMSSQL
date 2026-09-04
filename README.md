@@ -1,91 +1,159 @@
 # VirtualMSSQL
 
-**VirtualMSSQL** — SQLite loadable extension для доступа к Microsoft SQL Server через **Microsoft ODBC Driver 18 for SQL Server**. Реализация закрывает этапы R0–R13 роадмапа (гейты G0–G13 PASS); исходные исследовательские документы проекта:
+VirtualMSSQL is a SQLite extension that exposes Microsoft SQL Server tables, views, approved query results, and spatial data as SQLite virtual tables. Once loaded, remote data can be accessed through standard SQLite SQL. It can be queried, filtered, ordered, joined with local tables, streamed or materialized, and, when a stable key is available — modified using INSERT, UPDATE, and DELETE within transactions and savepoints.
 
-- `01_TZ_VirtualMSSQL.md` — техническое задание версии 1.0: назначение, архитектура, обязательные требования, ограничения, контракты корректности и критерии приёмки.
-- `02_ROADMAP_VirtualMSSQL.md` — единая release-critical карта R0–R18: этап → обязательные работы → gate.
-- `03_RESEARCH_NOTES_AND_SOURCES.md` — проверенные факты, архитектурные выводы, спорные места и первичные источники Microsoft/SQLite/GitHub.
+Currently, the extension is distributed as a single `virtualmssql.dll` for Win32 and Win64. It requires the [Microsoft ODBC Driver 18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server) to be installed on the machine; no other third-party client DLLs are bundled or required.
 
-## Базовое решение
+VirtualMSSQL is primarily intended for Windows applications that already use SQLite but also need secure, transactional access to SQL Server data without implementing a separate database access layer or middleware. It supports streaming reads, safe query pushdown, query materialization, credential providers (including Windows Credential Manager), strict TLS verification, explicit transactions and savepoints, cancellation, connection pooling, metadata caching with schema-integrity checks, and spatial columns as WKB/WKT.
 
-Production backend версии 1.0:
+## Features
 
-```text
-Microsoft ODBC Driver 18 for SQL Server
-```
+- SQL Server 2019, 2022, and 2025; SQLite host 3.44.0 or later with loadable-extension support.
+- Tables, views, and read-only query sources (`source='query'`) with a bounded T-SQL lexer and read-only validator.
+- Catalog metadata, type registry with a deterministic `UNSUPPORTED_TYPE` policy, and stable identity (integer / string / GUID / composite keys).
+- Proven-safe pushdown: projection, predicate, single-value `IN`, ordering, and `LIMIT`/`OFFSET`; everything else is rechecked locally.
+- DML for tables with a stable key; identity, computed, and rowversion columns remain server-owned.
+- Explicit transactions and savepoints on one canonical SQL Server identity; non-cancellable finalization with UNKNOWN-OUTCOME quarantine.
+- Streaming reads (LOBs included), independent cursors for parallel scans, bounded connection pool with clean-state verification.
+- Cancellation (`virtualmssql_cancel()`), login/query timeouts, monotonic operation deadlines, and a conservative read-only retry policy.
+- Materialization into a private SQLite database (`memory` or `temp`) with atomic publish.
+- Metadata cache (`metadata_mode='cached'`) with schema fingerprints, stale/drift/corrupt policies, and `xIntegrity` self-checks.
+- Credential providers (in-memory zero-on-free and Windows Credential Manager) with secret redaction in all diagnostics.
+- Spatial columns (`geometry`/`geography`) projected as WKB or WKT via `STAsBinary()`/`STAsText()`.
+- Quality gates: PVS-Studio, MSVC `/analyze`, ASan+UBSan, deterministic fuzzing with fault injection, and a full compatibility matrix.
 
-Runtime model:
+## Requirements
 
-```text
-host application
-    -> SQLite
-    -> virtualmssql.dll
-    -> Windows ODBC Driver Manager (odbc32.dll)
-    -> Microsoft ODBC Driver 18 (msodbcsql18.dll)
-    -> Microsoft SQL Server
-```
+- Windows 10+ (Win32 or x64).
+- [Microsoft ODBC Driver 18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server) installed (18.6.x tested).
+- A SQLite host of version 3.44.0 or later that supports loadable extensions.
+- Microsoft Visual C++ Redistributable 2015–2022.
+- A reachable SQL Server 2019/2022/2025 instance and a login with the permissions you expect (server ACLs and permissions remain in effect).
 
-На момент исследования актуальная Windows-ветка ODBC Driver 18 — **18.6.2.1**, дата выпуска **31 марта 2026**. Текущую версию перед релизом следует повторно проверять по Microsoft Learn.
+Mandatory limitations (deterministic behavior, no best-effort fallbacks):
 
-## Статус требований
+- No distributed atomicity between SQLite and SQL Server, or between different SQL Server identities.
+- No MARS: all access on one connection is serialized by the extension.
+- Types without a lossless mapping (`sql_variant`, `hierarchyid`, ...) fail the virtual table at CREATE time with `UNSUPPORTED_TYPE`.
+- DML/COMMIT/ROLLBACK and partially exposed streams are never retried.
+- `tls=verify` is the default; trusting arbitrary server certificates must be explicitly configured (`tls=trust`).
 
-- `MANDATORY` — блокирует выпуск VirtualMSSQL 1.0.
-- `EXPERIMENTAL` — не блокирует 1.0 и должен развиваться отдельно.
-- `UNSUPPORTED` — должен завершаться детерминированной ошибкой, а не работать «best effort».
+## Quick Start
 
-## Реализация (статус по этапам)
+Build all configurations and run the test suites (a live SQL Server is required for most suites; the connection profile is provided through `VMS_TEST_PROFILE`):
 
-- **R0 — ODBC feasibility probe: Gate G0 PASS** (2026-09-01). Пробник `tools/vms-odbc-probe`, результаты: `docs/research/r0-probe-results.md`. Ключевые находки: потолок параметров 1999; отмена только через `SQLCancelHandle(SQL_HANDLE_STMT)` на публикуемый воркером statement; `ColumnSize=0` запрещён для LONG-параметров (HY104, рабочий максимум `2^30-1`); ленивое начало транзакции подтверждено; `SQL_COPT_SS_AUTOBEGINTXN = 1402`.
-- **R1 — репозиторий/сборка/совместимость: Gate G1 PASS** (2026-09-01). `virtualmssql.dll` собирается в 4 конфигурациях (win32/x64 × debug/release, CMake + Ninja, `/W4`); экспорты `sqlite3_virtualmssql_init` + `sqlite3_extension_init`; runtime-гейт версии SQLite (baseline 3.44.0, без silent downgrade); стаб-модуль `virtualmssql_stub` + скаляр `virtualmssql_version()`; CTest-сьюты load/exports/capability/missing-driver — 4/4 PASS на всех конфигурациях; загрузка проверена через официальный sqlite3 CLI 3.53.4.
-- **R2 — foundation core: Gate G2 PASS** (2026-09-01). Checked arithmetic (`vms_add_sz/mul_sz/add_i64/mul_i64` — все переполнения ловятся на обеих архитектурах); bounded-буферы с zero-on-free; UTF-8/UTF-16 с явными границами и отказом на invalid encoding (кириллица, non-BMP surrogate pairs, lone surrogates); ресурс-лимиты (10 `max_*`, дефолт `max_parameters=1999` по данным R0, понижение-only); логирование с безусловной redaction секретов (`PWD=`, `password=` — case-insensitive, утечка в sink невозможна); versioned fingerprints (FNV-1a, соление stage-тегом); fault allocator (OOM-инъекция в bounded-buffer путь). CTest `foundation` — PASS на всех 4 конфигурациях.
-- **R3 — ODBC client runtime: Gate G3 PASS** (2026-09-02). Портативный слой `vms_client.h` (`VmsClient/Connection/Statement/Value/ColumnMeta/Error`) без единого ODBC-типа; весь ODBC изолирован в адаптере `vms_odbc_adapter.c` + connection-affine воркер `vms_odbc_worker.c` (один владелец HDBC/HSTMT, сериализация всех вызовов). Инварианты ТЗ подтверждены тестами: полная декодировка строки до видимости; инкрементные ординалы SQLGetData; `SQL_NO_DATA` как успех; статус-классификация (TRANSPORT→quarantine, HY008→CANCELLED); drain через `SQLMoreResults`; `vms_tran_begin/commit/rollback`; cross-thread cancel `vms_conn_cancel` (sqlite3_interrupt-семантика, `SQLCancelHandle(SQL_HANDLE_STMT)` — схема R0) с восстановлением соединения после отмены. Интеграционная сьюта `test_client` против SQL Server 2022 — PASS на всех 4 конфигурациях (6/6×4).
-- **R4 — connections/credentials/TLS/pool: Gate G4 PASS** (2026-09-02). `credential_ref` + версионированный ABI провайдеров (v1, проверка версии, отказ при неизвестной); провайдеры: in-memory (zero-on-free) и Windows Credential Manager (`CredRead`, префикс `VirtualMSSQL/`, wipe после использования — секрет живёт только внутри scope `secret_begin/end`); профиль `VmsProfile` + **строгая грамматика** `vms_profile_parse` (неизвестные ключи отвергаются — `RetryExec/DSN/FileDSN/Trusted_Connection` структурно невпихнуть); строгий билдер `vms_connstr_build` — дефолт `tls=verify` (Encrypt=Yes + TrustServerCertificate=No), опции trust/optional, безусловные `ConnectRetryCount=0`, `MARS_Connection=No`, секреты никогда не попадают в возвращаемую строку; bounded connection pool с clean-state верификацией перед reuse (`vms_conn_verify`: не-quarantined + `@@TRANCOUNT=0` + `SELECT 1` round-trip), грязные соединения закрываются, host DM pooling не трогается. Тесты ABI/грамматики/posture/redaction + живой pool-тест — PASS на всех 4 конфигурациях (7/7×4).
-- **R5 — metadata/type registry/stable identity: Gate G5 PASS** (2026-09-02). Слой `vms_meta` поверх каталога `sys.*` (schemas/objects/columns/types/indexes/index_columns/computed_columns/triggers) через R3-клиент; валидация идентификаторов + `N''`-экранирование — SQL-инъекция через имена невозможна; type registry (`sys.types` → `VmsColType`, корректный выбор TEXT/BIGTEXT/DECIMAL/DATETIME/GUID/BLOB); выбор stable identity key: PRIMARY KEY приоритетно, затем suitable UNIQUE NOT NULL; отсев unsuitable (nullable unique, computed key, filtered/disabled/hypothetical) подтверждён тестами на всех формах; versioned lossless identity token `v1` (int64 напрямую, text/blob — hex-кодирование, lossless round-trip, отбраковка мусора, truncation-safe). Интеграционные тесты на живом SQL Server 2022 — PASS на всех 4 конфигурациях (8/8×4).
-- **R6 — read-only tables and views: Gate G6 PASS** (2026-09-02). Полноценный vtab-модуль `virtualmssql`: `CREATE VIRTUAL TABLE x USING virtualmssql(schema='dbo', table='...')` — shape из каталога R5 при xConnect, декларация SQLite-схемы по affinity; read-only базовые таблицы **и представления**; курсоры на независимых lease-соединениях из bounded-пула (параллельные/вложенные сканы); потоковое чтение LOB (nvarchar(max)/varbinary(max)) через SQLGetData-чанки; скаляры `virtualmssql_profile()` (конфигурация) и `virtualmssql_cred()` (provisioning секретов внутрь DLL — состояние провайдера живёт в DLL, а не в хосте); ранний close освобождает lease немедленно. G6-матрица (empty/типы/NULL/Unicode+emoji/LOB/100k-row streaming с агрегатами/два курсора/early-close) — PASS на всех 4 конфигурациях (9/9×4). Производительность baseline: ~10с на 100k-строчный полный скан (pushdown приходит в R7).
-- **R7 — planner / safe pushdown: Gate G7 PASS** (2026-09-02). Компилятор планов `vms_plan`: xBestIndex анализирует constraints и потребляет **только доказуемо безопасные** операторы — проекция по colUsed (с учётом bit-63 fallback на все колонки), int-сравнения (EQ/LT/LE/GT/GE) только для INT-аффинных колонок и целых значений, IS NULL/IS NOT NULL, single-value IN (multi-value IN безопасно деградирует: одинаковое значение → equality, различное → contradiction `1=0`), ORDER BY только по int-колонкам (полный ORDER, не частичный), LIMIT через TOP(?)/OFFSET-FETCH (OFFSET только с ORDER BY, как требует T-SQL); текст-сравнения и текст-ORDER остаются локальными. План сериализуется в idxStr с magic/валидацией, параметры уходят в ODBC как типизированные SQLBIGINT-бинды (проверка каждого SQLBindParameter). Differential-тесты remote==local на живом сервере: 19 кейсов (проекция, 5 сравнений + negative + range, IS NULL/IS NOT NULL, IN, ORDER ASC/DESC+WHERE, LIMIT/LIMIT+OFFSET/OFFSET за границей, комбинированный, текст локальный, агрегаты) — PASS на всех 4 конфигурациях (10/10×4).
-- **R8 — source=query / query profiles: Gate G8 PASS** (2026-09-02). Bounded T-SQL lexer (`vms_lexer`, allocation-free, позиции+спаны, строки/комментарии/скобки/скобочные идентификаторы) + валидатор read-only: ровно один statement, голова SELECT/WITH, 40+ запрещённых ключевых слов (DML/DDL/EXEC/динамика/BULK/OPENROWSET...), запрет SELECT INTO, баланс скобок, только хвостовая `;`. Метаданные результата — `sys.dm_exec_describe_first_result_set` (не sp_, т.к. даёт плоский SELECT-набор: name/system_type_name/max_length/precision/scale/is_nullable); контракт результата: уникальные имена колонок, ≥1 колонка, type registry → VmsColType. Модуль расширен: `CREATE VIRTUAL TABLE x USING virtualmssql(source='query', query='...')` — запрос исполняется **как есть** (без outer wrapper: T-SQL запрещает WITH внутри derived tables, а валидатор уже гарантирует один read-only SELECT). G8-матрица: SELECT/CTE/JOIN/GROUP/window-источники, rejection-матрица (offline+live), metadata failure, duplicate-columns contract — PASS на всех 4 конфигурациях (11/11×4).
-- **R9 — Materialization: Gate G9 PASS** (2026-09-02). Материализатор `vms_mat`: query-source снапшот в private SQLite DB (`materialization='memory'` → `:memory:`, `'temp'` → приватный temp-файл, удаляется при destroy; `'off'` → потоковый режим R8). State machine **BUILDING → READY → PUBLISHED** / FAILED: снапшот заливается батчами по 2000 строк (промежуточные COMMIT внутри BUILDING), затем `query_indexes` — индекс на каждую INTEGER-колонку, затем **атомарная публикация** (единственная критическая секция state-store). Инвариант partial-never-published: cancel/OOM/лимит строк/ошибка сервера/ошибка индекса → FAILED, приватная БД уничтожается, читатели получают ошибку — PUBLISHED недостижим из частичного состояния. Курсор vtab в материализованном режиме читает снапшот через private-db statement (снапшот строится при первом скане). G9: happy path (12 строк + индексы + integrity), row-limit → FAILED, cancel → FAILED, temp-режим с cleanup, live vtab `materialization='memory'` с фильтрами — PASS на всех 4 конфигурациях (12/12×4).
-- **R10 — DML: Gate G10 PASS** (2026-09-03). Write path для `mode=rw` table-источников: `vms_dml` — генерация INSERT/UPDATE/DELETE inline-SQL (значения: int64/float как канонические литералы, текст как N'...' с удвоением кавычек после UTF-8→UTF-16; идентификаторы bracket-quoted validated; injection-поверхности нет). `mode=rw` гейт (без rw → SQLITE_READONLY; source=query + rw запрещено структурно); identity/computed/rowversion колонки исключены из записи (server-owned). Ключевое решение по ключам: xRowid stash — SQLite вызывает xRowid перед xUpdate, поэтому xRowid сохраняет **все** stable-key значения текущей строки в vtab; xUpdate строит WHERE из stash (**старые** значения ключа — изменение ключа не ретаргетит строку), что покрывает int/string/GUID/составные ключи; DELETE/UPDATE с изменённым ключом корректны. INSERT с NULL-ключом опускает ключевую колонку → работают server-side defaults (NEWID()); для rw-таблиц best_index форсирует проекцию ключевых колонок (used_mask), иначе stash неполон. Тест-инфраструктура: seed дополнен таблицами vms10_* (int/PK, composite PK, GUID PK DEFAULT NEWID(), rowversion, AFTER-trigger с логом, view без ключа); G10-матрица: INSERT/UPDATE/DELETE для int/string/GUID/composite ключей, неизменяемость ключа, rowversion server-owned (два UPDATE → разные hex-токены), AFTER-trigger (v+1 и запись в лог), rejections (view/query/ro). PASS на всех 4 конфигурациях (13/13×4).
-- **R11 — Transactions / Savepoints: Gate G11 PASS** (2026-09-03). Явные транзакции поверх vtab-модуля (iVersion=2, xBegin/xSync/xCommit/xRollback/xSavepoint/xRelease/xRollbackTo). Архитектура: **one canonical SQL Server identity** — pin одного соединения на lifetime транзакции (`vms_txn_pin`: SQL_ATTR_AUTOCOMMIT=OFF + SQL_COPT_SS_AUTOBEGINTXN=OFF + primer `SET XACT_ABORT ON`, чтобы runtime-ошибки делали транзакцию doomed и детектируемой через XACT_STATE()). **Lazy remote start**: явный `BEGIN TRANSACTION` отправляется при первом DML/savepoint (проверка @@TRANCOUNT для идемпотентности; SQLEndTran(COMMIT) ↔ один BEGIN — совместимая пара уровней). **Savepoints**: `SAVE TRANSACTION vms_sv_N` / `ROLLBACK TRANSACTION vms_sv_N` (генерируемые имена — validated identifiers); xRelease — только local bookkeeping. **Чтения внутри транзакции** идут через `vms_cursor_open_shared` (shared-курсор на pinned-соединении, сериализован его worker'ом) — видят собственные незакоммиченные записи; MARS принципиально не используется (MARS-транзакция привязана к batch → error 6401 на savepoints). **xSync validation-only**: XACT_STATE()==-1 → ошибка (doomed). **Финализация non-cancellable**: SQLEndTran COMMIT/ROLLBACK; сбой COMMIT на проводе → UNKNOWN_OUTCOME: соединение карантинится навсегда (never reused), клиент получает явную ошибку; lock-timeout → VMS_TXN_BUSY → SQLITE_BUSY. Удалён R10 defensive auto-commit (`IF @@TRANCOUNT>0 COMMIT TRAN` в job_dml) — он молча коммитил транзакцию после каждого DML и разрушал savepoints. G11: commit/rollback/nested-savepoint (ROLLBACK TO inner сохраняет outer)/savepoint-before-DML/doomed-транзакция после PK-конфликта/атомарный multi-statement rollback/read-only транзакция — PASS на всех 4 конфигурациях (14/14×4). Документировано: distributed atomicity между ordinary SQLite и SQL Server identities отсутствует (координация 2PC не входит в скоуп 1.0).
-- **R12 — Type matrix / spatial: Gate G12 PASS** (2026-09-03). Обязательная матрица типов: bit/tinyint/smallint/int/bigint (INTEGER), decimal/numeric/money/smallmoney (**exact TEXT policy**), real/float (REAL), char/varchar/nchar/nvarchar, binary/varbinary (BLOB), uniqueidentifier (canonical TEXT), date/time/datetime/smalldatetime/datetime2/datetimeoffset (ISO TEXT), xml (BIGTEXT), rowversion (8-байтовый binary токен), NULL-политика (каждая nullable-колонка читается NULL). **Spatial**: geometry/geography через server-side проекцию `STAsBinary()` (WKB, по умолчанию) или `STAsText()` (`spatial='wkt'`); WKB валидируется через mod_spatialite (`GeomFromWKB`/`ST_AsText`). **UNSUPPORTED_TYPE**: sql_variant/hierarchyid/прочие без lossless-маппинга → детерминированный reject при CREATE VIRTUAL TABLE с именем колонки и типа (policy: никаких тихих деградаций в TEXT). **Критический фикс кодировки**: ANSI-типы (char/varchar/text/xml) приходят от драйвера как ANSI-байты при SQLGetData(SQL_C_BINARY), а не UTF-16 — все ANSI-текстовые проекции оборачиваются в `CAST(col AS nvarchar(4000|max))`, что гарантирует UTF-16 независимо от collation; `SELECT *` в планах заменён на явную проекцию (звёздочка не может выразить CAST/STAs-обёртки). G12: read/null/boundary (tinyint=255, smallint=-32768, bigint=max, money=min)/round-trip + WKB/WKT spatial + UNSUPPORTED_TYPE — PASS на всех 4 конфигурациях (15/15×4).
-- **R13 — Metadata cache / shadow / integrity: Gate G13 PASS** (2026-09-03). Shadow-хранилище метаданных `vms_meta_cache` (private SQLite db, SQLITE_CORE): canonical-сериализация списка колонок (magic/version/count + name/type_name/vtype/flags/max_length/precision/scale) с **schema fingerprint** (FNV-1a 64) и UTC-таймстампом захвата. Параметр `metadata_mode=`: **live** (по умолчанию — каждое connect перечитывает сервер) / **cached** — консультирует shadow-кеш и применяет live validation policy: сервер доступен + fingerprint совпал → FRESH; fingerprint разошёлся → **SCHEMA_DRIFT** (reject, дроп кеш-записи, явное сообщение о recreate); сервер недоступен → **stale read** из кеша (работа без сервера); кеш-запись битая (fingerprint ≠ payload) → **CORRUPT** reject. **xShadowName** (iVersion=3): `<table>_vms_schema`/`<table>_vms_metadata` — зарезервированные module-private имена, rejected при CREATE. **xIntegrity** — offline self-check без remote-соединения: ncols в границах, непустые имена, валидные registry-типы, cached-mode vtab обязан нести ненулевой fingerprint. G13: live/cached/fresh-reconnect/stale/unit-corruption/unit-drift/shadow-name/integrity — PASS на всех 4 конфигурациях (16/16×4).
-- **R14 — Cancellation / timeout / resilience: Gate G14 PASS** (2026-09-03). **`virtualmssql_cancel()`** — scalar точка входа отмены: process-wide реестр живых соединений (singly-linked, guarded CS, register/unregister в conn_open/close) + `vms_client_cancel_all()` доставляет `SQLCancelHandle(SQL_HANDLE_STMT)` активному statement каждого соединения + `sqlite3_interrupt()` VM; потокобезопасно, callable из любого потока/соединения. **Monotonic operation deadline**: `vms_conn_arm_deadline(cn, ms)` — one-shot watcher (бounded ≤4 на соединение): по истечении бюджета активная операция получает cancel, флаг `deadline_fired` читается/сбрасывается. **query_timeout**: `vms_conn_set_query_timeout` (`SQL_ATTR_QUERY_TIMEOUT`) + применение профиля (`query_timeout=N`) на каждое новое pool-соединение (login_timeout уже через connstr). **Conservative read-only retry**: единственный разрешённый retry — свежее открытие read-only курсора (до первой строки, cursor ещё не существует) при TRANSPORT/CONNECT/TIMEOUT; DML/COMMIT/ROLLBACK и частично прочитанные стримы не ретраятся никогда (структурно: xUpdate/xCommit возвращают ошибку сразу). **Quarantine-семантика** переиспользована из R3/R11 (HY008 → соединение живёт; transport → карантин). G14 fault matrix: cancel idle/mid-scan (cross-thread)/cancel-completion race ×3, deadline non-fire path, query_timeout профиль, DML no-retry (PK violation ровно один раз), post-cancel reusability — PASS на всех 4 конфигурациях (17/17×4).
-- **R15 — Performance qualification: Gate G15 PASS** (2026-09-04). Бенчмарк-харнесс `tests/bench_r15.exe` (не ctest; `VMS_BENCH=quick|full`): cold connect / own-pool reuse / PK lookup / 1k-100k-1M narrow rows / 5000 wide rows (16 колонок) / LOB 1-16-64MB / projection+predicate+LIMIT pushdown. Метрики: time-to-first-row, p50/p95, rows/sec, MB/sec, peak RSS, pushdown speedup. Фикстуры в seed: `vms15_million` (1M narrow), `vms15_wide` (5000×16 колонок), `vms15_lob` (1/16/64MB через REPLICATE поверх nvarchar(max)-литерала — обычный REPLICATE обрезается до 8000 байт). База (2026-09-04): PK lookup p95 0.05ms; 100k narrow 553k rows/sec; 1M narrow 712k rows/sec (localhost) / 727k (LAN); wide 13-16k rows/sec; LOB 132-166 MB/sec (localhost), 24-46 MB/sec (LAN, `192.168.1.108` SQL Server 2022 Express); pushdown speedup 26k-57k×; peak RSS ≤240MB. **Regression thresholds для CI**: PK lookup p95 ≤ 50ms; narrow rows/sec ≥ 100k; wide ≥ 5k; LOB ≥ 10 MB/s; RSS ≤ 512MB; pushdown ≥ 10× — автоматический gate в bench_r15 (exit 1 при нарушении). G15: все mandatory workloads в пределах лимитов на обоих серверах — PASS (localhost full+quick, LAN quick; 17/17×4 ctest не затронут).
-- **R16 — Static analysis / fuzz / fault injection: Gate G16 PASS** (2026-09-04). **PVS-Studio 7.29** (CLMonitor поверх Ninja-сборки): 49 находок в проектном коде — все триажированы; **исправлены реальные дефекты**: V595 (inds разыменовывался до проверки — text-only DML мог писать в NULL), V614 (в транзакционном full-scan в shared-курсор передавался непроинициализированный SQL-буфер — построен all-columns план), V610 (signed shift UB: used_mask/omit_mask переведены на unsigned + `1u <<`; биты колонок 31–61 теперь кодируются корректно), V506 (указатель на стековый scratch утекал в worker-job), V1028 ×2 (int overflow в size-вычислениях), V1048/V547/V781 (мёртвый код, недостижимые условия, индекс-до-проверки). Остальные — задокументированные false positives (src/vms16-triage.pvsconfig: V524 легаси-алиас, V566 ODBC-идиома SQLPOINTER, V575 free(NULL), V6262 стековые буферы worker-потоков, V1044 cross-thread CV, V522/V597 анализатор-артефакты). **MSVC /analyze** (VMS_ANALYZE=ON, preset-опция): 0 memory-safety warnings после фиксов (C6262 стек задокументированы). **ASan+UBSan** (clang-cl 19.1.5 из MSVC toolchain; новый preset **asan-x64**; динамический `clang_rt.asan_dynamic-x86_64.dll` копируется к каждому бинарнику — модель "one DLL for all runtime configurations"): полный ctest 18/18 без единого sanitizer-репорта (UAF/overrun/double-free не обнаружены). **Fuzz-харнесс `test_r16`** (детерминированный xorshift-мутатор, VMS_FUZZ_ROUNDS, каждый 4-й раунд под allocator-failure injection): 7 поверхностей — profile/connstr, T-SQL lexer+validator, план serialize/deserialize, identity-токен, metadata serializer/shadow-check, UTF-кодеки (strict round-trip контракт), bounded buffers (включая double-free safety). **Рефакторинг**: identity-кодек + identifier-валидация вынесены из vms_meta.c в ODBC-независимый `vms_identity.c` (fuzz-харнесс линкуется без ODBC-адаптера). **Баг-фикс тестов**: r11 cleanup — однопроходный streaming DELETE мог пропускать строки (серверная видимость после DML); сделан многопроходный с проверкой. G16: 18/18×4 конфигурации + 18/18 под ASan+UBSan, ни одного memory-safety отказа/краша/UAF/double-free/утечки владения транзакцией.
-- **R17 — Compatibility qualification: Gate G17 PASS** (2026-09-05). Матрица (полная — `docs/compatibility-matrix.md`): **SQL Server 2019** (15.0.4480.2, docker) 18/18 ×2; **SQL Server 2022** (Developer 16.0.4265.1 docker + Express 16.0.1190.2 Windows LAN) 18/18 на трёх конфигурациях; **SQL Server 2025** (17.0.4075.5 RTM-CU8, docker) 18/18 на x64-debug/x64-release/asan-x64; **Win32** (win32-debug/release против 2019/2022) 18/18; **SQL auth** — все прогоны; **Windows auth** — `auth=windows` (Trusted_Connection=Yes) с NETONLY-учёткой (CreateProcessWithLogonW LOGON_NETCREDENTIALS_ONLY) против 2022 Express LAN — SSPI + vtab-запрос PASS; workgroup-отказ без кред — детерминированный (корректное отказное поведение); **TLS trust** — все прогоны; **TLS verify** — детерминированный отказ на self-signed (08001) — семантика корректна; **ODBC Driver 18.6.2.1** (latest на стенде). Попутные фиксы: retry-hardened seed (pooled-сессии ctest держат метаданные-локи на DROP TABLE), row-точный cleanup r10 (multi-value IN деградирует в contradiction — cleanup по v-значениям не удалял ничего), многопроходный cleanup r11, retry-cleanup r14, диагностика ошибок в r11. Все прогоны G17 — двойные (повторяемость состояния).
-- **R18 — Packaging / release: Gate G18 PASS** (2026-09-05). Пакет `VirtualMSSQL-1.0.0-windows.zip` (сборка `scripts/package-r18.ps1`): Win32/x64 `virtualmssql.dll` (release), `include/virtualmssql/vms_api.h`, README, examples (`load_smoke.c`), licenses + `THIRD-PARTY-NOTICES`, `MANIFEST.txt` (toolset/commit/дата/требования), `SBOM.txt` (инвентарь бинарей и системных зависимостей), `SHA256SUMS.txt` (контрольные суммы артефактов). **Публичный ABI (v1) — 5 экспортов** (`vms_api.h`): `virtualmssql_api_version()` (=1), `virtualmssql_register_credential_provider(const void* VmsCredProviderV1)`, `virtualmssql_register_query_profile_provider(const void* VmsQueryProfileProviderV1)` + потребление `conn='key'` в vtab (резолв через провайдера; identity-проверка против активного env — пер-втаб профили UNSUPPORTED, детерминированный отказ), `virtualmssql_wincred_provider()`, `virtualmssql_cancel(sqlite3*)`. Экспорт entry-точек теперь через `VMS_EXPORT` в заголовке. **Acceptance**: DLL из staging загружаются чистым CLI (PATH без dev-окружения), все 5 ABI-символов присутствуют (x64+Win32), SHA256SUMS совпадают, `virtualmssql_cancel()` из пакета корректно прерывает запрос. G18: reproducible-скрипт + clean-machine load + artifacts + headers + checksums + SBOM + acceptance — PASS.
-
-### Быстрая сборка
-
-```powershell
-# из окружения "vcvarsall x64" (или x86 для Win32-конфигураций)
+```pwsh
+# from a Visual Studio developer prompt
 cmake --preset x64-release
 cmake --build --preset x64-release
+
+$env:VMS_TEST_PROFILE = 'server=localhost,1433;auth=sql;cred=test;tls=trust'
+& .\build\x64-release\tests\seed_r6.exe          # create test fixtures on the server
 ctest --preset x64-release
 ```
 
-Скрипт-обёртка: `scripts/build-and-test.ps1 -Arch x64 -Config release`.
+Performance qualification and sanitizer builds are separate presets/scripts:
 
-SQLite для тестов (официальные прекомпилированные DLL 3.53.4) лежит в `third_party/bin/{x64,x86}` — в release-артефакт не входит.
+```pwsh
+cmake --build --preset asan-x64                  # AddressSanitizer + UBSan build
+.\build\x64-release\tests\bench_r15.exe          # performance qualification
+```
 
-## Зависимости virtualmssql.dll (runtime)
+See `docs/compatibility-matrix.md` for the qualified server/auth/TLS matrix and `docs/stage-log.md` for the per-stage gate history (R0–R18).
 
-Анализ выполнен утилитой Dependencies (depends) 2.x для x64 и Win32 release-сборок; списки импорта идентичны.
+## Example
 
-Прямые импорты DLL:
+```sql
+-- one-time setup per connection: credentials and the connection profile
+SELECT virtualmssql_cred('app/reporting:uid', 'app_user');
+SELECT virtualmssql_cred('app/reporting:pwd', '<secret>');
+SELECT virtualmssql_profile('server=srv01,1433;db=app;auth=sql;cred=app/reporting;tls=verify');
 
-| Модуль | Назначение | Примечание |
+-- expose a remote table
+CREATE VIRTUAL TABLE temp.orders USING virtualmssql(
+  schema='dbo', table='orders', mode='rw'
+);
+
+-- read: pushdown of projection, predicate and LIMIT; everything rechecked locally
+SELECT order_id, created_at
+FROM orders
+WHERE status = 2
+ORDER BY order_id
+LIMIT 10;
+
+-- write: values are sent as literals generated from validated identifiers only
+INSERT INTO orders(id, name, val) VALUES(42, 'acme', 7);
+UPDATE orders SET val = 9 WHERE id = 42;
+DELETE FROM orders WHERE id = 42;
+
+-- a read-only query source (a single SELECT, validated before use)
+CREATE VIRTUAL TABLE temp.stats USING virtualmssql(
+  source='query', query='SELECT region, SUM(amount) AS total FROM dbo.orders GROUP BY region'
+);
+```
+
+Spatial columns are projected as WKB by default (`spatial='wkb'`) or as WKT (`spatial='wkt'`); metadata can be cached with `metadata_mode='cached'`.
+
+## Virtual Table Arguments
+
+| Argument | Values | Default | Description |
+|---|---|---|---|
+| `schema=` | identifier | — | Remote schema (table sources). |
+| `table=` | identifier | — | Remote table (table sources). |
+| `source=` | `table` / `query` | `table` | Table source or validated query source. |
+| `query=` | T-SQL SELECT | — | Required for `source='query'`. |
+| `mode=` | `ro` / `rw` | `ro` | `rw` enables DML for tables with a stable key. |
+| `materialization=` | `off` / `memory` / `temp` | `off` | Query-source snapshot mode. |
+| `spatial=` | `wkb` / `wkt` | `wkb` | Representation of `geometry`/`geography` columns. |
+| `metadata_mode=` | `live` / `cached` | `live` | `cached` consults the shadow cache with live validation. |
+| `conn=` | key | — | Profile key resolved through a registered query-profile provider. |
+
+## SQL Functions
+
+| Function | Description |
+|---|---|
+| `virtualmssql_version()` | Extension version string. |
+| `virtualmssql_profile('spec')` | Set the connection profile for this process. |
+| `virtualmssql_cred('key:uid', 'v')` | Provision a secret under `key:uid` / `key:pwd`. |
+| `virtualmssql_cancel()` | Cancel all in-flight remote operations and interrupt the VM. |
+
+## Public API (ABI v1)
+
+Hosts may link `virtualmssql.dll` directly (see `include/virtualmssql/vms_api.h`):
+
+| Export | Description |
+|---|---|
+| `virtualmssql_api_version()` | Returns the public ABI version (currently 1). |
+| `virtualmssql_register_credential_provider(p)` | Register a `VmsCredProviderV1` credential provider. |
+| `virtualmssql_register_query_profile_provider(p)` | Register a query-profile provider (`conn='key'` resolution). |
+| `virtualmssql_wincred_provider()` | Built-in Windows Credential Manager provider instance. |
+| `virtualmssql_cancel(db)` | Cancel in-flight remote operations; interrupts the VM. |
+
+## Documentation
+
+| Section | Documents |
+|---|---|
+| Quality and release | [Compatibility matrix](docs/compatibility-matrix.md), [Stage log G0–G18](docs/stage-log.md) |
+| Research | [R0 ODBC probe results](docs/research/r0-probe-results.md) |
+| Specification | [Technical specification v1.0 (TZ)](01_TZ_VirtualMSSQL.md), [Roadmap R0–R18](02_ROADMAP_VirtualMSSQL.md), [Research notes](03_RESEARCH_NOTES_AND_SOURCES.md) |
+| Examples | [load_smoke.c](examples/load_smoke.c) |
+
+## Dependencies
+
+Runtime dependencies of `virtualmssql.dll` (verified with Dependencies/depends for both architectures):
+
+| Module | Source | Notes |
 |---|---|---|
-| `ODBC32.dll` | Windows ODBC Driver Manager: все SQL* вызовы, SQLCancelHandle, атрибуты соединения | системная (Windows); в свою очередь загружает `msodbcsql18.dll` — Microsoft ODBC Driver 18 for SQL Server, **обязательный production backend** (устанавливается отдельно, не входит в состав DLL) |
-| `ADVAPI32.dll` | `CredReadW`/`CredFree` — Windows Credential Manager provider (профиль `cred=`) | системная |
-| `sqlite3.dll` | api-thunk: SQLite API для виртуальных таблиц, приватных snapshot/meta-cache БД | **не системная**: нужен SQLite 3.44+ рядом с DLL или в хост-процессе (хост, загрузивший расширение, уже имеет SQLite; тесты используют официальный `sqlite3.dll` 3.53.4 из `third_party/bin`) |
-| `KERNEL32.dll` | потоки/воркеры, HeapAlloc, Interlocked, критические секции | системная |
-| `VCRUNTIME140.dll` | CRT runtime (MSVC `/MD`) | VC++ Redistributable |
-| `api-ms-win-crt-*` (string, environment, stdio, runtime, heap, convert, time) | UCRT | системная (Windows 10+) |
+| `ODBC32.dll` | Windows | ODBC Driver Manager; loads Microsoft ODBC Driver 18 (`msodbcsql18.dll`) — **required, installed separately**. |
+| `ADVAPI32.dll` | Windows | Windows Credential Manager (`CredReadW`). |
+| `KERNEL32.dll` | Windows | Workers, heap, interlocked, critical sections. |
+| `sqlite3.dll` or host SQLite | Host application | SQLite 3.44.0+; **not bundled** — the host that loads the extension provides it. |
+| `VCRUNTIME140.dll`, `api-ms-win-crt-*` | VC++ Redistributable / UCRT | Standard MSVC runtime. |
 
-Резолв через ApiSet Schema: все `api-ms-win-*` и `KERNEL32` указывают на `ucrtbase.dll`/`kernelbase.dll` системного префикса.
+## Runtime Support
 
-Итого для работы в продакшене: **(1)** установленный Microsoft ODBC Driver 18 for SQL Server, **(2)** SQLite 3.44+ в хост-процессе или `sqlite3.dll` рядом, **(3)** VC++ Redistributable 2015–2022 (`vcruntime140.dll`), **(4)** права чтения Windows Credential Manager при использовании `auth=sql` + `cred=` с системным провайдером. Драйвер ODBC Driver 17 и старше, FreeTDS, OLE DB — не поддерживаются по ТЗ.
+Currently, Windows is the only supported runtime. The extension follows the architectural approach of the sibling projects [VirtualPostgreSQL](https://github.com/alexeydott/VirtualPostgreSQL) and [VirtualMySQL](https://github.com/alexeydott/VirtualMySQL).
 
-Косвенная зависимость по данным профиля: сервер SQL Server 2019/2022/2025 (проверяется в R17).
+## License
 
+See `licenses/THIRD-PARTY.md` for third-party notices (SQLite headers and test binaries; the SQLite source itself is public domain). The project license is defined at the repository root.
