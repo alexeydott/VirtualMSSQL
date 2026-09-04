@@ -314,14 +314,67 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
     return SQLITE_OK;
 }
 
-int sqlite3_virtualmssql_init(sqlite3* db, char** pzErrMsg,
-                              const sqlite3_api_routines* pApi)
+/* ---- R18 public ABI ---- */
+
+int virtualmssql_api_version(void)
+{
+    return VIRTUALMSSQL_API_VERSION;
+}
+
+int virtualmssql_register_credential_provider(const void* provider_v1)
+{
+    const VmsCredProviderV1* p = (const VmsCredProviderV1*)provider_v1;
+    if (!vms_cred_provider_valid(p)) return 1;
+    vms_cred_set_provider(p);
+    return 0;
+}
+
+/* query-profile provider registry (R18): the extension supports one
+ * registered provider; its profiles resolve the conn='key' vtab argument
+ * against the active env profile (identity check; per-vtab profiles are
+ * UNSUPPORTED in the 1.0 single-env scope and fail deterministically). */
+static const VmsQueryProfileProviderV1* g_qprofile = NULL;
+
+int virtualmssql_register_query_profile_provider(const void* provider_v1)
+{
+    const VmsQueryProfileProviderV1* p =
+        (const VmsQueryProfileProviderV1*)provider_v1;
+    if (!p || p->abi_version != VMS_QPROFILE_PROVIDER_ABI_VERSION ||
+        !p->name || !p->get_profile) return 1;
+    g_qprofile = p;
+    return 0;
+}
+
+const void* virtualmssql_wincred_provider(void)
+{
+    return vms_cred_wincred_provider();
+}
+
+int virtualmssql_cancel(sqlite3* db)
+{
+    int signaled = vms_client_cancel_all();
+    if (db) sqlite3_interrupt(db);
+    return signaled;
+}
+
+/* resolve conn='key' through the registered provider into resolved_spec.
+ * Returns 0 on success; 1 unknown key; 2 no provider registered. */
+int vms_ext_resolve_qprofile(const char* key, char* resolved_spec, size_t cap)
+{
+    if (!g_qprofile) return 2;
+    if (g_qprofile->get_profile(g_qprofile->ctx, key,
+                                resolved_spec, cap) != 0) return 1;
+    return 0;
+}
+
+VMS_EXPORT int sqlite3_virtualmssql_init(sqlite3* db, char** pzErrMsg,
+                                         const sqlite3_api_routines* pApi)
 {
     return sqlite3_virtualmssql_init_impl(db, pzErrMsg, pApi);
 }
 
-int sqlite3_extension_init(sqlite3* db, char** pzErrMsg,
-                           const sqlite3_api_routines* pApi)
+VMS_EXPORT int sqlite3_extension_init(sqlite3* db, char** pzErrMsg,
+                                      const sqlite3_api_routines* pApi)
 {
     return sqlite3_virtualmssql_init_impl(db, pzErrMsg, pApi);
 }

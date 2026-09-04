@@ -135,6 +135,8 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     int mat_mode_parsed = VMS_MAT_OFF;
     int spatial_wkt = 0; /* R12: default spatial representation = WKB */
     int metadata_cached = 0; /* R13: default metadata_mode = live */
+    const char* conn_key = NULL; /* R18: conn='key' via qprofile provider */
+    char conn_key_buf[256];
 
     (void)argc;
     if (!g_env) {
@@ -211,6 +213,10 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
                 *pzErr = sqlite3_mprintf("virtualmssql: metadata_mode must be 'live' or 'cached'");
                 return SQLITE_ERROR;
             }
+        } else if (!strncmp(a, "conn=", 5)) {
+            const char* sv = a + 5;
+            if (sv[0] == '\'') sv++;
+            conn_key = sv;
         } else {
             *pzErr = sqlite3_mprintf("virtualmssql: unknown argument '%s'", a);
             return SQLITE_ERROR;
@@ -242,6 +248,11 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
             query_buf[n - 2] = 0;
             query = query_buf;
         }
+        if (conn_key && conn_key[0] == '\'' && (n = strlen(conn_key)) >= 2 && conn_key[n-1] == '\'') {
+            memcpy(conn_key_buf, conn_key + 1, n - 2);
+            conn_key_buf[n - 2] = 0;
+            conn_key = conn_key_buf;
+        }
     }
     if (!is_query &&
         (!vms_meta_ident_valid(schema, 128) || !vms_meta_ident_valid(table, 128))) {
@@ -261,6 +272,52 @@ static int vms_vtab_connect(sqlite3* db, void* pAux, int argc,
     if (!tab) return SQLITE_NOMEM;
     memset(tab, 0, sizeof(*tab));
     tab->env = g_env;
+
+    /* R18: conn='key' resolves through the registered query-profile
+     * provider; the resolved spec must describe the SAME identity as the
+     * active env (single-env 1.0 scope; per-vtab profiles are
+     * UNSUPPORTED and fail deterministically). */
+    if (conn_key) {
+        char resolved[1024];
+        VmsProfile resolved_p;
+        VmsError perr;
+        extern int vms_ext_resolve_qprofile(const char*, char*, size_t);
+        memset(&perr, 0, sizeof(perr));
+        memset(&resolved_p, 0, sizeof(resolved_p));
+        if (!vms_meta_ident_valid(conn_key, 128)) {
+            *pzErr = sqlite3_mprintf("virtualmssql: invalid conn key");
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+        switch (vms_ext_resolve_qprofile(conn_key, resolved, sizeof(resolved))) {
+        case 0: break;
+        case 1:
+            *pzErr = sqlite3_mprintf("virtualmssql: UNKNOWN_PROFILE_KEY: conn key '%s' is not known to the provider", conn_key);
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        default:
+            *pzErr = sqlite3_mprintf("virtualmssql: UNSUPPORTED: conn= requires a registered query profile provider");
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+        if (!vms_profile_parse(resolved, &resolved_p, &perr)) {
+            *pzErr = sqlite3_mprintf("virtualmssql: conn provider returned a bad profile: %s", perr.message);
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+        if (wcscmp(resolved_p.server, g_env->profile.server) != 0 ||
+            wcscmp(resolved_p.database, g_env->profile.database) != 0 ||
+            resolved_p.auth != g_env->profile.auth ||
+            resolved_p.tls != g_env->profile.tls ||
+            wcscmp(resolved_p.cred.key, g_env->profile.cred.key) != 0) {
+            *pzErr = sqlite3_mprintf(
+                "virtualmssql: UNSUPPORTED: conn key '%s' resolves to a different SQL Server identity than the active profile",
+                conn_key);
+            sqlite3_free(tab);
+            return SQLITE_ERROR;
+        }
+        /* identity match: the vtab proceeds on the shared env */
+    }
     tab->is_query_source = is_query;
     if (is_query) {
         strncpy_s(tab->query_spec, sizeof(tab->query_spec), query, _TRUNCATE);
