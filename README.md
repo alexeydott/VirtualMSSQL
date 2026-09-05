@@ -20,6 +20,7 @@ VirtualMSSQL is primarily intended for Windows applications that already use SQL
 - Metadata cache (`metadata_mode='cached'`) with schema fingerprints, stale/drift/corrupt policies, and `xIntegrity` self-checks.
 - Credential providers (in-memory zero-on-free and Windows Credential Manager) with secret redaction in all diagnostics.
 - Spatial columns (`geometry`/`geography`) projected as WKB or WKT via `STAsBinary()`/`STAsText()`.
+- Remote schema inspection via table-valued functions (`virtualmssql_tables`, `virtualmssql_table_info`, `virtualmssql_index_list`, `virtualmssql_index_info`).
 - Quality gates: PVS-Studio, MSVC `/analyze`, ASan+UBSan, deterministic fuzzing with fault injection, and a full compatibility matrix.
 
 ## Requirements
@@ -165,6 +166,7 @@ Hosts may link `virtualmssql.dll` directly (see `include/virtualmssql/vms_api.h`
 | Research | [R0 ODBC probe results](docs/research/r0-probe-results.md) |
 | Specification | [Technical specification v1.0 (TZ)](01_TZ_VirtualMSSQL.md), [Roadmap R0–R18](02_ROADMAP_VirtualMSSQL.md), [Research notes](03_RESEARCH_NOTES_AND_SOURCES.md) |
 | Examples | [load_smoke.c](examples/load_smoke.c) |
+| Dependencies | Runtime dependencies of `virtualmssql.dll` (see [Dependencies](#dependencies)) |
 
 ## Dependencies
 
