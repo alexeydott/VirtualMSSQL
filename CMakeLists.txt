@@ -42,6 +42,7 @@ add_library(vms_client STATIC
     src/vms_dml.c
     src/vms_meta_cache.c
     src/vms_identity.c
+    src/vms_schema.c
     src/vms_vtab.c
 )
 target_include_directories(vms_client PUBLIC

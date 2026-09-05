@@ -6,6 +6,9 @@
 #include "vms_vtab.h"
 #include "vms_connstr.h"
 #include "vms_credentials.h"
+
+/* R18: schema inspection table functions (vms_schema.c) */
+int vms_schema_register_all(sqlite3* db);
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
@@ -217,6 +220,48 @@ static void cancel_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
     sqlite3_result_int(ctx, signaled);
 }
 
+/* scalar wrappers for the R18 public ABI (SQL-level access) */
+static void abi_version_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
+{
+    (void)argc; (void)argv;
+    sqlite3_result_int(ctx, virtualmssql_api_version());
+}
+
+static void wincred_provider_func(sqlite3_context* ctx, int argc, sqlite3_value** argv)
+{
+    (void)argc; (void)argv;
+    /* return 1 when the built-in wincred provider is available */
+    sqlite3_result_int(ctx, virtualmssql_wincred_provider() ? 1 : 0);
+}
+
+static void register_cred_provider_func(sqlite3_context* ctx, int argc,
+                                        sqlite3_value** argv)
+{
+    (void)argc;
+    if (sqlite3_value_type(argv[0]) != SQLITE_TEXT) {
+        sqlite3_result_error(ctx, "virtualmssql_register_credential_provider expects a text value", -1);
+        return;
+    }
+    /* the SQL-level variant only accepts the built-in wincred provider
+     * (a hex-encoded provider struct cannot cross SQL); the C ABI accepts
+     * real structs */
+    if (virtualmssql_wincred_provider()) {
+        vms_cred_set_provider(vms_cred_wincred_provider());
+        sqlite3_result_int(ctx, 0);
+    } else {
+        sqlite3_result_error(ctx, "wincred provider unavailable", -1);
+    }
+}
+
+static void register_qprofile_provider_func(sqlite3_context* ctx, int argc,
+                                            sqlite3_value** argv)
+{
+    (void)argc; (void)argv;
+    sqlite3_result_error(ctx,
+        "virtualmssql_register_query_profile_provider requires the C ABI "
+        "(SQL-level registration is not supported)", -1);
+}
+
 static int vms_vtab_env_init(sqlite3* db, char** pzErrMsg)
 {
     VmsProfile profile;
@@ -298,6 +343,27 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
                                 cancel_func, NULL, NULL) != SQLITE_OK) {
         return SQLITE_ERROR;
     }
+    /* R18: public ABI scalar accessors */
+    if (sqlite3_create_function(db, "virtualmssql_api_version", 0,
+                                SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                                abi_version_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    if (sqlite3_create_function(db, "virtualmssql_wincred_provider", 0,
+                                SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                                wincred_provider_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    if (sqlite3_create_function(db, "virtualmssql_register_credential_provider", 1,
+                                SQLITE_UTF8, NULL,
+                                register_cred_provider_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    if (sqlite3_create_function(db, "virtualmssql_register_query_profile_provider", 1,
+                                SQLITE_UTF8, NULL,
+                                register_qprofile_provider_func, NULL, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
     /* R6: register the real module eagerly when a profile is already
      * available (env var); otherwise it registers lazily inside the
      * virtualmssql_profile() scalar. */
@@ -310,6 +376,11 @@ int sqlite3_virtualmssql_init_impl(sqlite3* db, char** pzErrMsg,
         }
     } else {
         g_profile_db = db;
+    }
+    /* R18: schema inspection table functions (self-contained; a profile
+     * is supplied per call through the connection-spec argument) */
+    if (vms_schema_register_all(db) != SQLITE_OK) {
+        return SQLITE_ERROR;
     }
     return SQLITE_OK;
 }

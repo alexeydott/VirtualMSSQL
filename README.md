@@ -108,6 +108,34 @@ Spatial columns are projected as WKB by default (`spatial='wkb'`) or as WKT (`sp
 | `metadata_mode=` | `live` / `cached` | `live` | `cached` consults the shadow cache with live validation. |
 | `conn=` | key | — | Profile key resolved through a registered query-profile provider. |
 
+## Remote Schema Inspection
+
+Four read-only, eponymous table functions inspect the remote SQL Server schema through ordinary SQLite queries:
+
+```sql
+SELECT * FROM virtualmssql_tables('server=srv;auth=sql;cred=app;tls=verify', 'dbo');
+
+SELECT * FROM virtualmssql_table_info(
+  'server=srv;auth=sql;cred=app;tls=verify', 'dbo', 'orders');
+
+SELECT * FROM virtualmssql_index_list(
+  'server=srv;auth=sql;cred=app;tls=verify', 'dbo', 'orders');
+
+SELECT * FROM virtualmssql_index_info(
+  'server=srv;auth=sql;cred=app;tls=verify', 'dbo', 'orders', 'PK_orders');
+```
+
+The first argument is a comma-separated runtime connection specification in the `virtualmssql_profile` grammar. Remote identifiers are validated and inlined as N''-quoted literals; user input never enters SQL as raw text. The functions are direct-only: invoke them from top-level SQL.
+
+| Function | Visible result columns |
+|---|---|
+| `virtualmssql_tables(connection, schema)` | table_schema, table_name, table_type |
+| `virtualmssql_table_info(connection, schema, table)` | cid, name, type, notnull, dflt_value, pk, ordinal, max_length, precision, scale, is_nullable, is_identity, is_computed, hidden_flags |
+| `virtualmssql_index_list(connection, schema, table)` | seq, name, unique, origin, partial, is_disabled, column_count |
+| `virtualmssql_index_info(connection, schema, table, index)` | seqno, cid, name, desc, collation, key, is_primary_key, is_unique, is_disabled, key_ordinal, is_nullable |
+
+The SQLite-style columns follow the conventions of the corresponding PRAGMA table functions. For `table_info`, `pk` is the one-based position inside the primary key (0 if not in the PK), and `hidden_flags` is 0 for ordinary columns or 2 for computed columns. For `index_list`, `origin` is `pk`, `u`, or `c`. Remote metadata comes from `sys.columns`, `sys.indexes`, and `sys.index_columns`.
+
 ## SQL Functions
 
 | Function | Description |

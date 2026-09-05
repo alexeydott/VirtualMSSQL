@@ -259,6 +259,17 @@ target_include_directories(bench_r15 PRIVATE
 target_link_libraries(bench_r15 PRIVATE vms_test_harness vms_client psapi)
 target_compile_options(bench_r15 PRIVATE /utf-8)
 
+# ---- suite 20: remote schema inspection + ABI (G18 addendum; live server) ----
+add_executable(test_r18 test_r18.c)
+target_include_directories(test_r18 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${SQLITE_INCLUDE_DIR}
+)
+target_link_libraries(test_r18 PRIVATE vms_test_harness vms_client)
+target_compile_options(test_r18 PRIVATE /utf-8)
+add_dependencies(test_r18 virtualmssql)
+add_test(NAME r18 COMMAND test_r18 $<TARGET_FILE:virtualmssql>)
+
 # seed helper (not a test): creates R6 fixtures on the live server
 add_executable(seed_r6 seed_r6.c)
 target_link_libraries(seed_r6 PRIVATE vms_client)
