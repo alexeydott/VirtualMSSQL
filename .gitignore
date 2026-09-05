@@ -30,3 +30,5 @@ probe-*.log
 wkt.txt
 
 *.nativecodeanalysis.xml
+
+docs/

@@ -60,8 +60,6 @@ cmake --build --preset asan-x64                  # AddressSanitizer + UBSan buil
 .\build\x64-release\tests\bench_r15.exe          # performance qualification
 ```
 
-See `docs/compatibility-matrix.md` for the qualified server/auth/TLS matrix and `docs/stage-log.md` for the per-stage gate history (R0–R18).
-
 ## Example
 
 ```sql
@@ -157,16 +155,6 @@ Hosts may link `virtualmssql.dll` directly (see `include/virtualmssql/vms_api.h`
 | `virtualmssql_register_query_profile_provider(p)` | Register a query-profile provider (`conn='key'` resolution). |
 | `virtualmssql_wincred_provider()` | Built-in Windows Credential Manager provider instance. |
 | `virtualmssql_cancel(db)` | Cancel in-flight remote operations; interrupts the VM. |
-
-## Documentation
-
-| Section | Documents |
-|---|---|
-| Quality and release | [Compatibility matrix](docs/compatibility-matrix.md), [Stage log G0–G18](docs/stage-log.md) |
-| Research | [R0 ODBC probe results](docs/research/r0-probe-results.md) |
-| Specification | [Technical specification v1.0 (TZ)](01_TZ_VirtualMSSQL.md), [Roadmap R0–R18](02_ROADMAP_VirtualMSSQL.md), [Research notes](03_RESEARCH_NOTES_AND_SOURCES.md) |
-| Examples | [load_smoke.c](examples/load_smoke.c) |
-| Dependencies | Runtime dependencies of `virtualmssql.dll` (see [Dependencies](#dependencies)) |
 
 ## Dependencies
 
